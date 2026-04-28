@@ -145,7 +145,7 @@ def isolate_pointer(warped, template):
     Subtract the template from the warped image.
     Returns a binary mask where the pointer pixels are white.
     """
-    diff = cv.subtract(warped, template)
+    diff = cv.subtract(template, warped)#cv.subtract(warped, template)
     blurred = cv.GaussianBlur(diff, (DIFF_BLUR_KSIZE, DIFF_BLUR_KSIZE), 0)
     _, mask = cv.threshold(blurred, DIFF_THRESHOLD, 255, cv.THRESH_BINARY)
     return diff, mask
@@ -230,7 +230,8 @@ def main():
     if not camera.isOpened():
         raise RuntimeError("Cannot open camera")
 
-    print("Press 'd' to quit.")
+    save_next = False
+    print("Press 'd' to quit, 'g' to save debug images.")
 
     while True:
         ret, frame = camera.read()
@@ -256,6 +257,8 @@ def main():
             best_diff_val = -1
             best_mask = None
             best_warped_bin = None
+            all_diffs = []
+            all_diff_vals = []
             
             # Detect circle in warped image for radius matching
             warped_radius, _ = get_circle_params(warped_bin)
@@ -266,9 +269,12 @@ def main():
             for rot in range(4):
                 rotated_warped = np.rot90(warped_bin, rot)
                 diff, mask = isolate_pointer(rotated_warped, adj_template_bin)
+                all_diffs.append(diff)
                 
                 # The correct rotation and scale should have the greatest difference
                 diff_val = np.sum(diff)
+                all_diff_vals.append(diff_val)
+                
                 if diff_val > best_diff_val:
                     best_diff_val = diff_val
                     best_mask = mask
@@ -285,6 +291,42 @@ def main():
                     c_mask_img = np.zeros_like(pointer_mask)
                     cv.circle(c_mask_img, c_mask, int(r_mask), 255, -1)
                     pointer_mask = cv.bitwise_and(pointer_mask, c_mask_img)
+
+            if save_next:
+                # 1. Save 4 subtractions
+                for i, d_img in enumerate(all_diffs):
+                    # Add diff_val as text on the image
+                    d_img_annotated = d_img.copy()
+                    cv.putText(d_img_annotated, f"Diff Val: {all_diff_vals[i]}", (10, 30),
+                               cv.FONT_HERSHEY_SIMPLEX, 0.8, 255, 2)
+                    cv.imwrite(f"diff_{i*90}.png", d_img_annotated)
+                
+                # 2. Camera image with contour (frame already has it drawn)
+                cv.imwrite("camera_contour.png", frame)
+                
+                # 3. Recorde (crop) before homography, without contour
+                x_min, y_min = np.min(corners, axis=0).astype(int)
+                x_max, y_max = np.max(corners, axis=0).astype(int)
+                h, w = gray.shape
+                x_min, y_min = max(0, x_min), max(0, y_min)
+                x_max, y_max = min(w, x_max), min(h, y_max)
+                crop_img = gray[y_min:y_max, x_min:x_max]
+                cv.imwrite("recorde_limpo.png", crop_img)
+                
+                # 4. Image after homography (best matching rotation)
+                cv.imwrite("warped_homography.png", best_warped_bin)
+                # 5. Save the adjusted template used
+                cv.imwrite("adjusted_template.png", adj_template_bin)
+                # 6. Save the final masked pointer mask
+                cv.imwrite("pointer_mask_final.png", pointer_mask)
+                
+                # 7. Save the oriented image with the exterior blacked out
+                if best_warped_bin is not None:
+                    warped_masked = cv.bitwise_and(best_warped_bin, c_mask_img)
+                    cv.imwrite("warped_masked.png", warped_masked)
+                
+                print("Images saved.")
+                save_next = False
 
             # ── Step 4: PCA angle ────────────────────────────────────────
             if best_mask is not None:
@@ -311,8 +353,11 @@ def main():
         cv.imshow('webcam', frame)
         cv.imshow('template', template_bin)
 
-        if cv.waitKey(20) & 0xFF == ord('d'):
+        key = cv.waitKey(20) & 0xFF
+        if key == ord('d'):
             break
+        elif key == ord('g'):
+            save_next = True
 
     camera.release()
 
