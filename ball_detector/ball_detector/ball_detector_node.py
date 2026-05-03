@@ -38,6 +38,25 @@ class BallDetectorNode(Node):
         
         contours, _ = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
         
+        output_frame = current_frame.copy()
+        
+        for cnt in contours:
+            if cv2.contourArea(cnt) > 50:
+                c_mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
+                cv2.drawContours(c_mask, [cnt], -1, 255, -1)
+                mean_hsv = cv2.mean(hsv, mask=c_mask)[:3]
+                
+                cv2.drawContours(output_frame, [cnt], -1, (0, 255, 0), 2)
+                M = cv2.moments(cnt)
+                if M['m00'] != 0:
+                    cx_cnt = int(M['m10']/M['m00'])
+                    cy_cnt = int(M['m01']/M['m00'])
+                    label = f"H:{int(mean_hsv[0])} S:{int(mean_hsv[1])} V:{int(mean_hsv[2])}"
+                    cv2.putText(output_frame, label, (cx_cnt - 20, cy_cnt - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+        
+        cv2.imshow("Ball Detector", output_frame)
+        cv2.waitKey(1)
+        
         det_msg = BallDetection()
         det_msg.header.stamp = self.get_clock().now().to_msg()
         det_msg.header.frame_id = 'horizontal_camera_link'
