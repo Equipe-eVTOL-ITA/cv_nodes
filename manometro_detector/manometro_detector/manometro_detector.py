@@ -1,11 +1,14 @@
+import rclpy
+from rclpy.node import Node
+from sensor_msgs.msg import CompressedImage
+from std_msgs.msg import Float32
+from cv_bridge import CvBridge
+
 import cv2 as cv
 import numpy as np
 import os
 
-# Suprime os avisos do backend do Qt sobre a falta de fontes
-os.environ["QT_LOGGING_RULES"] = "qt.qpa.fonts.warning=false"
-
-# ── Configuration ────────────────────────────────────────────────────────────
+# Configurações
 TEMPLATE_SIZE = 400          # Side length (px) for the canonical square
 DIFF_BLUR_KSIZE = 7          # (Median) Blur kernel for diff cleanup
 DIFF_THRESHOLD = 30          # Threshold applied after blur on the diff image
@@ -13,6 +16,7 @@ EPSILON_RAMER_DOUGLAS_PEUCKER = 0.04 # Valor do epsilon para o algoritmo de RDP
 ROI_RADIUS_RATIO = 0.30      # Define a ROI interna (para ignorar os números da borda)
 ROI_OFFSET_Y = -20           # Deslocamento vertical do centro da ROI
 ROI_OFFSET_X = 0             # Deslocamento horizontal do centro da ROI
+MAX_POINTER_PIXELS = 2500    # Limite máximo de pixels brancos (ruído). Acima disso = Miss Detection
 
 # Angle (degrees, math convention: 0=right, CCW positive) observed when the
 # pointer is at the 0-pressure and 100-pressure marks.
@@ -330,133 +334,132 @@ def angle_to_pressure(angle_deg):
     pressure = fraction * 100.0
     return np.clip(pressure, 0.0, 100.0)
 
+class ManometroDetector(Node):
+    def __init__(self):
+        super().__init__('manometro_detector')
 
-def main():
-    # ── Load template ────────────────────────────────────────────────────
-    assets_dir = os.path.join(os.path.dirname(__file__), 'assets')
-    template_path = os.path.join(assets_dir, 'template2.png')
-    template = cv.imread(template_path, cv.IMREAD_GRAYSCALE)
-    if template is None:
-        raise FileNotFoundError(f"Template not found: {template_path}")
+        self.bridge = CvBridge()
 
-    # Resize template to canonical size and binarize
-    template = cv.resize(template, (TEMPLATE_SIZE, TEMPLATE_SIZE))
-    clahe = cv.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
-    template = clahe.apply(template)
-    _, template_bin = cv.threshold(template, 0, 255, cv.THRESH_BINARY | cv.THRESH_OTSU)
-    
-    # ── Step 1.5: Detect circle in template ──────────────────────────────
-    template_radius, _ = get_circle_params(template_bin)
-    if template_radius is None:
-        print("Warning: Circle not found in template. Resize alignment might fail.")
+        self.img_sub = self.create_subscription(
+            CompressedImage,
+            '/vertical_camera/compressed',
+            self.callback,
+            10 # QoS
+        )
 
-    # ── Open camera ──────────────────────────────────────────────────────
-    camera = cv.VideoCapture(0)
-    if not camera.isOpened():
-        raise RuntimeError("Cannot open camera")
+        self.pressure_pub = self.create_publisher(
+            Float32,
+            '/measured_pressure',
+            10 #QoS
+        )
 
-    print("Press 'd' to quit.")
+        # Load template
+        assets_dir = os.path.join(os.path.dirname(__file__), 'assets')
+        template_path = os.path.join(assets_dir, 'template2.png')
+        template = cv.imread(template_path, cv.IMREAD_GRAYSCALE)
+        if template is None:
+            raise FileNotFoundError(f"Template not found: {template_path}")
 
-    while True:
-        ret, frame = camera.read()
-        if not ret:
-            break
-
-        gray = cv.cvtColor(frame, cv.COLOR_BGR2GRAY)
+        # Resize template
+        template = cv.resize(template, (TEMPLATE_SIZE, TEMPLATE_SIZE))
         clahe = cv.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
-        gray = clahe.apply(gray)
-        _, binary = cv.threshold(gray, 0, 255, cv.THRESH_BINARY | cv.THRESH_OTSU)
+        template = clahe.apply(template)
+        _, self.template_bin = cv.threshold(template, 0, 255, cv.THRESH_BINARY | cv.THRESH_OTSU)
 
-        # ── Step 2: find & warp the white square ─────────────────────────
-        corners = find_square(binary)
-        if corners is not None:
-            # Draw detected square on original frame (for debug)
-            for i in range(4):
-                pt1 = tuple(corners[i].astype(int))
-                pt2 = tuple(corners[(i + 1) % 4].astype(int))
-                cv.line(frame, pt1, pt2, (0, 255, 0), 2)
+        # Detectar um circulo no template
+        self.template_radius, _ = get_circle_params(self.template_bin)
+        if self.template_radius is None:
+            self.get_logger().warn("Circle not found in template. Resize alignment might fail.")
 
-            warped = warp_to_square(gray, corners, TEMPLATE_SIZE)
-            _, warped_bin = cv.threshold(warped, 0, 255, cv.THRESH_BINARY | cv.THRESH_OTSU)
-
-            # ── Step 3: template subtraction (Radius Alignment + 4 rotations) ──
-            best_diff_val = -1
-            best_mask = None
-            best_warped_bin = None
+    def callback(self, msg):
+        try:
+            pressure = -1.0
             
-            # Detect circle in warped image for radius matching
-            warped_radius, _ = get_circle_params(warped_bin)
-            # Adjust template to match warped image circle size
-            adj_template_bin = adjust_template(template_bin, warped_radius, template_radius)
-            
-            # Test 0, 90, 180, 270 degrees
-            for rot in range(4):
-                rotated_warped = np.rot90(warped_bin, rot)
-                diff, mask = isolate_pointer(rotated_warped, adj_template_bin)
+            frame = self.bridge.compressed_imgmsg_to_cv2(msg)
+
+            gray = cv.cvtColor(frame, cv.COLOR_BGR2GRAY)
+            clahe = cv.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+            gray = clahe.apply(gray)
+            _, binary = cv.threshold(gray, 0, 255, cv.THRESH_BINARY | cv.THRESH_OTSU)
+
+            corners = find_square(binary)
+            if corners is not None:
+                warped = warp_to_square(gray, corners, TEMPLATE_SIZE)
+                _, warped_bin = cv.threshold(warped, 0, 255, cv.THRESH_BINARY | cv.THRESH_OTSU)
+
+                # Template subtraction (Radius Alignment + 4 rotations)
+                best_diff_val = -1
+                best_mask = None
+                best_warped_bin = None
                 
-                # The correct rotation and scale should have the greatest difference
-                diff_val = np.sum(diff)
-                if diff_val > best_diff_val:
-                    best_diff_val = diff_val
-                    best_mask = mask
-                    best_warped_bin = rotated_warped
-                    best_diff_img = diff
-
-            pointer_mask = best_mask
-
-            # ── Step 3.5: Circle Masking ─────────────────────────────────
-            # Isolate only the area inside the manometer circle
-            if best_warped_bin is not None:
-                r_mask, c_mask = get_circle_params(best_warped_bin)
-                if r_mask is not None and c_mask is not None:
-                    c_mask_img = np.zeros_like(pointer_mask)
-                    # Ajusta o centro da ROI usando os offsets configurados
-                    adjusted_center = (c_mask[0] + ROI_OFFSET_X, c_mask[1] + ROI_OFFSET_Y)
-                    # Aplica o raio da ROI (Region of Interest) para ignorar sujeiras nas bordas
-                    cv.circle(c_mask_img, adjusted_center, int(r_mask * ROI_RADIUS_RATIO), 255, -1)
-                    pointer_mask = cv.bitwise_and(pointer_mask, c_mask_img)
-
-            # ── Step 4: Angle Detection ──────────────────────────────────
-            if best_mask is not None:
-                angle, centroid = pointer_angle_pca(pointer_mask)
-                #angle, centroid = pointer_angle_moments(pointer_mask)
-                #angle, centroid = pointer_angle_hough(pointer_mask)
+                # Detect circle in warped image for radius matching
+                warped_radius, _ = get_circle_params(warped_bin)
+                # Adjust template to match warped image circle size
+                adj_template_bin = adjust_template(self.template_bin, warped_radius, self.template_radius)
                 
-            if angle is not None:
-                # ── Step 5: Correct angle and compute pressure ───────────────
-                angle = correct_angle_homography(angle, best_warped_bin)
-                pressure = angle_to_pressure(angle)
-                cx, cy = int(centroid[0]), int(centroid[1])
+                # Test 0, 90, 180, 270 degrees
+                for rot in range(4):
+                    rotated_warped = np.rot90(warped_bin, rot)
+                    diff, mask = isolate_pointer(rotated_warped, adj_template_bin)
+                    
+                    # The correct rotation and scale should have the greatest difference
+                    diff_val = np.sum(diff)
+                    if diff_val > best_diff_val:
+                        best_diff_val = diff_val
+                        best_mask = mask
+                        best_warped_bin = rotated_warped
 
-                # Draw pointer direction on warped image
-                length = 80
-                ex = int(cx + length * np.cos(np.radians(angle)))
-                ey = int(cy - length * np.sin(np.radians(angle)))
-                warped_vis = cv.cvtColor(best_warped_bin, cv.COLOR_GRAY2BGR)
-                cv.arrowedLine(warped_vis, (cx, cy), (ex, ey), (0, 0, 255), 2)
-                
-                # Draw centroids (PCA and Absolute center)
-                cv.circle(warped_vis, (cx, cy), 4, (0, 0, 255), -1)  # Red: detected centroid
-                cv.circle(warped_vis, (TEMPLATE_SIZE // 2, TEMPLATE_SIZE // 2), 4, (255, 0, 0), -1) # Blue: absolute center
-                
-                cv.putText(warped_vis, f"Angle: {angle:.1f} deg", (10, 25),
-                           cv.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-                cv.putText(warped_vis, f"Pressure: {pressure:.1f}", (10, 55),
-                           cv.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                pointer_mask = best_mask
 
-                cv.imshow('warped + pointer', warped_vis)
-                cv.imshow('diff', best_diff_img)
-                cv.imshow('pointer mask', pointer_mask)
+                # Isolate only the area inside the manometer circle
+                if best_warped_bin is not None:
+                    r_mask, c_mask = get_circle_params(best_warped_bin)
+                    if r_mask is not None and c_mask is not None:
+                        c_mask_img = np.zeros_like(pointer_mask)
+                        # Ajusta o centro da ROI usando os offsets configurados
+                        adjusted_center = (c_mask[0] + ROI_OFFSET_X, c_mask[1] + ROI_OFFSET_Y)
+                        # Aplica o raio da ROI (Region of Interest) para ignorar sujeiras nas bordas
+                        cv.circle(c_mask_img, adjusted_center, int(r_mask * ROI_RADIUS_RATIO), 255, -1)
+                        pointer_mask = cv.bitwise_and(pointer_mask, c_mask_img)
 
-        cv.imshow('webcam', frame)
-        cv.imshow('template', template_bin)
+                # Angle detection
+                angle = None
+                if best_mask is not None:
+                    # Conta a "massa" de pixels brancos (ruído / ponteiro)
+                    white_pixels = cv.countNonZero(pointer_mask)
+                    
+                    if white_pixels > MAX_POINTER_PIXELS:
+                        self.get_logger().warn(f"MISS DETECTION: Excesso de ruído absoluto - {white_pixels} px")
+                    else:
+                        angle, centroid = pointer_angle_pca(pointer_mask)
+                        #angle, centroid = pointer_angle_moments(pointer_mask)
+                        #angle, centroid = pointer_angle_hough(pointer_mask)
+                        
+                if angle is not None:
+                        # Correcao do angulo
+                        angle = correct_angle_homography(angle, best_warped_bin)
+                        pressure = angle_to_pressure(angle)
+                        
+            # Publica a pressao como Float32 (valor real ou -1.0 se falhou)
+            msg_out = Float32()
+            msg_out.data = float(pressure)
+            self.pressure_pub.publish(msg_out)
 
-        if cv.waitKey(20) & 0xFF == ord('d'):
-            break
+        except Exception as e:
+            self.get_logger().error(f"Erro no callback de imagem: {str(e)}")
 
-    camera.release()
-
+def main(args=None):
+    rclpy.init(args=args)
+    
+    manometro_node = ManometroDetector()
+    
+    try:
+        rclpy.spin(manometro_node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        manometro_node.destroy_node()
+        rclpy.shutdown()
 
 if __name__ == '__main__':
     main()
-    cv.destroyAllWindows()
