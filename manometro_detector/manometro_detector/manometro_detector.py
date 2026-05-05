@@ -2,24 +2,26 @@ import cv2 as cv
 import numpy as np
 import os
 
+# Suprime os avisos do backend do Qt sobre a falta de fontes
+os.environ["QT_LOGGING_RULES"] = "qt.qpa.fonts.warning=false"
+
 # ── Configuration ────────────────────────────────────────────────────────────
 TEMPLATE_SIZE = 400          # Side length (px) for the canonical square
-BINARY_THRESHOLD = 100       # Grayscale → binary threshold
-DIFF_BLUR_KSIZE = 7          # Gaussian blur kernel for diff cleanup
+DIFF_BLUR_KSIZE = 7          # (Median) Blur kernel for diff cleanup
 DIFF_THRESHOLD = 30          # Threshold applied after blur on the diff image
+EPSILON_RAMER_DOUGLAS_PEUCKER = 0.04 # Valor do epsilon para o algoritmo de RDP
+ROI_RADIUS_RATIO = 0.30      # Define a ROI interna (para ignorar os números da borda)
+ROI_OFFSET_Y = -20           # Deslocamento vertical do centro da ROI
+ROI_OFFSET_X = 0             # Deslocamento horizontal do centro da ROI
 
 # Angle (degrees, math convention: 0=right, CCW positive) observed when the
 # pointer is at the 0-pressure and 100-pressure marks.
-# These MUST be calibrated once with known reference images.
-ANGLE_AT_0   = 225.0         # pointer pointing to ~7 o'clock  (bottom-left)
-ANGLE_AT_100 = -45.0         # pointer pointing to ~5 o'clock  (bottom-right)
-# The sweep goes CW from 225° down to -45° (equivalently 315°), which is 270°.
-
+ANGLE_AT_0   = 240.0
+ANGLE_AT_100 = -60.0
 
 def order_corners(pts):
     """
     Order 4 corner points as: top-left, top-right, bottom-right, bottom-left.
-    Works with any rotation / perspective of the quadrilateral.
     """
     rect = np.zeros((4, 2), dtype="float32")
     s = pts.sum(axis=1)
@@ -44,7 +46,7 @@ def find_square(binary):
         if area < 1000:
             continue
         peri = cv.arcLength(cnt, True)
-        approx = cv.approxPolyDP(cnt, 0.04 * peri, True)
+        approx = cv.approxPolyDP(cnt, EPSILON_RAMER_DOUGLAS_PEUCKER * peri, True)
         if len(approx) == 4 and area > best_area:
             best = approx
             best_area = area
@@ -145,8 +147,8 @@ def isolate_pointer(warped, template):
     Subtract the template from the warped image.
     Returns a binary mask where the pointer pixels are white.
     """
-    diff = cv.subtract(warped, template)
-    blurred = cv.GaussianBlur(diff, (DIFF_BLUR_KSIZE, DIFF_BLUR_KSIZE), 0)
+    diff = cv.absdiff(warped, template)
+    blurred = cv.medianBlur(diff, DIFF_BLUR_KSIZE)
     _, mask = cv.threshold(blurred, DIFF_THRESHOLD, 255, cv.THRESH_BINARY)
     return diff, mask
 
@@ -195,6 +197,127 @@ def pointer_angle_pca(mask):
     return angle_deg, (cx, cy)
 
 
+def pointer_angle_moments(mask):
+    """
+    Use image moments on the white pixels of `mask` to find the dominant direction.
+    """
+    M = cv.moments(mask)
+    if M["m00"] == 0:
+        return None, None
+        
+    cx = M["m10"] / M["m00"]
+    cy = M["m01"] / M["m00"]
+    
+    mu20 = M["mu20"] / M["m00"]
+    mu02 = M["mu02"] / M["m00"]
+    mu11 = M["mu11"] / M["m00"]
+    
+    angle_rad = 0.5 * np.arctan2(2 * mu11, mu20 - mu02)
+    vx, vy = np.cos(angle_rad), np.sin(angle_rad)
+    
+    coords = cv.findNonZero(mask)
+    if coords is None:
+        return None, None
+    coords = coords.reshape(-1, 2).astype(np.float64)
+    img_center = np.array([mask.shape[1] / 2.0, mask.shape[0] / 2.0])
+    mean = np.array([cx, cy])
+    
+    projections = (coords - mean) @ np.array([vx, vy])
+    pos_mask = projections > 0
+    neg_mask = ~pos_mask
+    
+    if pos_mask.any() and neg_mask.any():
+        mean_pos = coords[pos_mask].mean(axis=0)
+        mean_neg = coords[neg_mask].mean(axis=0)
+        dist_pos = np.linalg.norm(mean_pos - img_center)
+        dist_neg = np.linalg.norm(mean_neg - img_center)
+        if dist_neg > dist_pos:
+            vx, vy = -vx, -vy
+            
+    angle_rad = np.arctan2(-vy, vx)
+    angle_deg = np.degrees(angle_rad)
+    
+    return angle_deg, (cx, cy)
+
+
+def pointer_angle_hough(mask):
+    """
+    Use Probabilistic Hough Transform to find the dominant direction.
+    """
+    lines = cv.HoughLinesP(mask, 1, np.pi/180, threshold=20, minLineLength=30, maxLineGap=10)
+    if lines is None or len(lines) == 0:
+        return None, None
+        
+    longest = 0
+    best_line = lines[0][0]
+    for line in lines:
+        x1, y1, x2, y2 = line[0]
+        length = np.sqrt((x2 - x1)**2 + (y2 - y1)**2)
+        if length > longest:
+            longest = length
+            best_line = line[0]
+            
+    x1, y1, x2, y2 = best_line
+    cx = (x1 + x2) / 2.0
+    cy = (y1 + y2) / 2.0
+    
+    vx = x2 - x1
+    vy = y2 - y1
+    norm = np.sqrt(vx**2 + vy**2)
+    if norm > 0:
+        vx, vy = vx/norm, vy/norm
+        
+    img_center = np.array([mask.shape[1] / 2.0, mask.shape[0] / 2.0])
+    p1 = np.array([x1, y1])
+    p2 = np.array([x2, y2])
+    dist1 = np.linalg.norm(p1 - img_center)
+    dist2 = np.linalg.norm(p2 - img_center)
+    
+    if dist1 > dist2:
+        vx = x1 - x2
+        vy = y1 - y2
+    else:
+        vx = x2 - x1
+        vy = y2 - y1
+        
+    angle_rad = np.arctan2(-vy, vx)
+    angle_deg = np.degrees(angle_rad)
+    
+    return angle_deg, (cx, cy)
+
+
+def correct_angle_homography(angle_deg, warped_bin):
+    """
+    Uses the contour of the warped image to find the ellipse generated by homography.
+    Corrects the angle according to the ellipse axes ratio to reverse perspective distortion.
+    """
+    contours, _ = cv.findContours(warped_bin, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return angle_deg
+        
+    largest_contour = max(contours, key=cv.contourArea)
+    if len(largest_contour) < 5:
+        return angle_deg
+        
+    _, (minor_axis, major_axis), _ = cv.fitEllipse(largest_contour)
+    
+    if major_axis == 0:
+        return angle_deg
+        
+    k = minor_axis / major_axis
+    if k == 0 or np.isnan(k):
+        return angle_deg
+        
+    rad = np.radians(angle_deg)
+    
+    # tan(theta_real) = k * tan(theta_lido)
+    vy_real = k * np.sin(rad)
+    vx_real = np.cos(rad)
+    
+    real_rad = np.arctan2(vy_real, vx_real)
+    return np.degrees(real_rad)
+
+
 def angle_to_pressure(angle_deg):
     """
     Map detected pointer angle to pressure value (0–100).
@@ -218,7 +341,9 @@ def main():
 
     # Resize template to canonical size and binarize
     template = cv.resize(template, (TEMPLATE_SIZE, TEMPLATE_SIZE))
-    _, template_bin = cv.threshold(template, BINARY_THRESHOLD, 255, cv.THRESH_BINARY)
+    clahe = cv.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+    template = clahe.apply(template)
+    _, template_bin = cv.threshold(template, 0, 255, cv.THRESH_BINARY | cv.THRESH_OTSU)
     
     # ── Step 1.5: Detect circle in template ──────────────────────────────
     template_radius, _ = get_circle_params(template_bin)
@@ -238,7 +363,9 @@ def main():
             break
 
         gray = cv.cvtColor(frame, cv.COLOR_BGR2GRAY)
-        _, binary = cv.threshold(gray, BINARY_THRESHOLD, 255, cv.THRESH_BINARY)
+        clahe = cv.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+        gray = clahe.apply(gray)
+        _, binary = cv.threshold(gray, 0, 255, cv.THRESH_BINARY | cv.THRESH_OTSU)
 
         # ── Step 2: find & warp the white square ─────────────────────────
         corners = find_square(binary)
@@ -250,7 +377,7 @@ def main():
                 cv.line(frame, pt1, pt2, (0, 255, 0), 2)
 
             warped = warp_to_square(gray, corners, TEMPLATE_SIZE)
-            _, warped_bin = cv.threshold(warped, BINARY_THRESHOLD, 255, cv.THRESH_BINARY)
+            _, warped_bin = cv.threshold(warped, 0, 255, cv.THRESH_BINARY | cv.THRESH_OTSU)
 
             # ── Step 3: template subtraction (Radius Alignment + 4 rotations) ──
             best_diff_val = -1
@@ -283,13 +410,21 @@ def main():
                 r_mask, c_mask = get_circle_params(best_warped_bin)
                 if r_mask is not None and c_mask is not None:
                     c_mask_img = np.zeros_like(pointer_mask)
-                    cv.circle(c_mask_img, c_mask, int(r_mask), 255, -1)
+                    # Ajusta o centro da ROI usando os offsets configurados
+                    adjusted_center = (c_mask[0] + ROI_OFFSET_X, c_mask[1] + ROI_OFFSET_Y)
+                    # Aplica o raio da ROI (Region of Interest) para ignorar sujeiras nas bordas
+                    cv.circle(c_mask_img, adjusted_center, int(r_mask * ROI_RADIUS_RATIO), 255, -1)
                     pointer_mask = cv.bitwise_and(pointer_mask, c_mask_img)
 
-            # ── Step 4: PCA angle ────────────────────────────────────────
+            # ── Step 4: Angle Detection ──────────────────────────────────
             if best_mask is not None:
                 angle, centroid = pointer_angle_pca(pointer_mask)
+                #angle, centroid = pointer_angle_moments(pointer_mask)
+                #angle, centroid = pointer_angle_hough(pointer_mask)
+                
             if angle is not None:
+                # ── Step 5: Correct angle and compute pressure ───────────────
+                angle = correct_angle_homography(angle, best_warped_bin)
                 pressure = angle_to_pressure(angle)
                 cx, cy = int(centroid[0]), int(centroid[1])
 
@@ -299,6 +434,11 @@ def main():
                 ey = int(cy - length * np.sin(np.radians(angle)))
                 warped_vis = cv.cvtColor(best_warped_bin, cv.COLOR_GRAY2BGR)
                 cv.arrowedLine(warped_vis, (cx, cy), (ex, ey), (0, 0, 255), 2)
+                
+                # Draw centroids (PCA and Absolute center)
+                cv.circle(warped_vis, (cx, cy), 4, (0, 0, 255), -1)  # Red: detected centroid
+                cv.circle(warped_vis, (TEMPLATE_SIZE // 2, TEMPLATE_SIZE // 2), 4, (255, 0, 0), -1) # Blue: absolute center
+                
                 cv.putText(warped_vis, f"Angle: {angle:.1f} deg", (10, 25),
                            cv.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
                 cv.putText(warped_vis, f"Pressure: {pressure:.1f}", (10, 55),
