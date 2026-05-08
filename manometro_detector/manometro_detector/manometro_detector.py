@@ -1,7 +1,7 @@
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import CompressedImage
-from std_msgs.msg import Float32
+from std_msgs.msg import Float32, Int16MultiArray
 from cv_bridge import CvBridge
 
 import cv2 as cv
@@ -34,7 +34,7 @@ def order_corners(pts):
     d = np.diff(pts, axis=1)
     rect[1] = pts[np.argmin(d)]   # top-right has smallest x-y
     rect[3] = pts[np.argmax(d)]   # bottom-left has largest x-y
-    return rect
+    return rect, (rect[0]+rect[1]+rect[2]+rect[3])
 
 
 def find_square(binary):
@@ -353,6 +353,12 @@ class ManometroDetector(Node):
             10 #QoS
         )
 
+        self.position_manometro = self.create_publisher(
+            Int16MultiArray,
+            '/position_manometer',
+            10 # QoS
+        )
+
         # Load template
         assets_dir = os.path.join(os.path.dirname(__file__), 'assets')
         template_path = os.path.join(assets_dir, 'template2.png')
@@ -382,7 +388,7 @@ class ManometroDetector(Node):
             gray = clahe.apply(gray)
             _, binary = cv.threshold(gray, 0, 255, cv.THRESH_BINARY | cv.THRESH_OTSU)
 
-            corners = find_square(binary)
+            corners, centro = find_square(binary)
             if corners is not None:
                 warped = warp_to_square(gray, corners, TEMPLATE_SIZE)
                 _, warped_bin = cv.threshold(warped, 0, 255, cv.THRESH_BINARY | cv.THRESH_OTSU)
@@ -444,6 +450,9 @@ class ManometroDetector(Node):
             msg_out = Float32()
             msg_out.data = float(pressure)
             self.pressure_pub.publish(msg_out)
+
+            position = Int16MultiArray()
+            position.data = [centro[0], centro[1]]
 
         except Exception as e:
             self.get_logger().error(f"Erro no callback de imagem: {str(e)}")
