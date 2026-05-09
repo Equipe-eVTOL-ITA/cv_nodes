@@ -1,0 +1,374 @@
+import rclpy
+from rclpy.node import Node
+from sensor_msgs.msg import CompressedImage
+from custom_msgs.msg import BouncingDetection
+from cv_bridge import CvBridge
+import cv2
+import cv2.aruco as aruco
+import numpy as np
+
+try:
+    import easyocr as _easyocr
+    EASYOCR_AVAILABLE = True
+except ImportError:
+    EASYOCR_AVAILABLE = False
+
+try:
+    import pytesseract
+    PYTESSERACT_AVAILABLE = True
+except ImportError:
+    PYTESSERACT_AVAILABLE = False
+
+
+class BouncingDetectorNode(Node):
+    def __init__(self):
+        super().__init__('bouncing_detector_node')
+
+        # Initialise OCR reader once — loading the model on every frame would be too slow.
+        self._ocr = None
+        if EASYOCR_AVAILABLE:
+            self.get_logger().info('EasyOCR available — using it for digit reading.')
+            self._ocr = _easyocr.Reader(['en'], gpu=False, verbose=False)
+        elif PYTESSERACT_AVAILABLE:
+            self.get_logger().info('pytesseract available — using it as fallback digit reader.')
+        else:
+            self.get_logger().warn(
+                'Neither EasyOCR nor pytesseract found. '
+                'Falling back to contour-based digit classification (less reliable). '
+                'Install EasyOCR with: pip install easyocr')
+
+        self.declare_parameter('vertical_camera_topic', '/vertical_camera/compressed')
+        camera_topic = self.get_parameter('vertical_camera_topic').get_parameter_value().string_value
+
+        self.publisher_  = self.create_publisher(BouncingDetection, 'bouncing_detection', 10)
+        self.debug_pub_  = self.create_publisher(CompressedImage, 'bouncing_detection_image/compressed', 10)
+        self.subscription = self.create_subscription(
+            CompressedImage, camera_topic, self.image_callback, 10)
+
+        self.br = CvBridge()
+        self.aruco_dict   = aruco.getPredefinedDictionary(aruco.DICT_5X5_100)
+        self.aruco_params = aruco.DetectorParameters()
+
+        # Latched target: persists across frames so base matching works even
+        # when the ArUco is no longer in view (e.g. during SEARCH_BASE).
+        self._cached_target_calculated = False
+        self._cached_target_base = ''
+
+    # ------------------------------------------------------------------ #
+    #  DIVISIBILITY RULE  (SAE 2026 edital)                               #
+    # ------------------------------------------------------------------ #
+
+    def calculate_target_number(self, aruco_id):
+        """
+        Returns '3', '4', or '5' — the number written inside the correct landing base.
+        Rule: the base whose number is an exact divisor of the ArUco ID.
+        Checks in descending order (5→4→3) as a tie-breaker for ambiguous IDs
+        (e.g. 60 is divisible by all three); competition IDs are expected to be unambiguous.
+        """
+        for n in [5, 4, 3]:
+            if aruco_id % n == 0:
+                return str(n)
+        self.get_logger().warn(f'ArUco ID {aruco_id} has no divisor in {{3, 4, 5}}')
+        return None
+
+    # ------------------------------------------------------------------ #
+    #  SHAPE DETECTION                                                     #
+    # ------------------------------------------------------------------ #
+
+    def detect_shape(self, contour):
+        """
+        Returns 'TRIANGULO', 'HEXAGONO', or 'ESTRELA' — the three shapes used
+        in the SAE 2026 competition.  All other contours return 'UNKNOWN'.
+
+        Detection strategy:
+          - ESTRELA : low solidity (many concavities) + many polygon vertices.
+              Stars have a convex-hull area much larger than their own area.
+          - TRIANGULO : 3 vertices after polygon approximation.
+          - HEXAGONO   : 5–8 vertices (approximation tolerance can collapse some
+              hexagon edges, so a range is safer than an exact count).
+        """
+        peri   = cv2.arcLength(contour, True)
+        approx = cv2.approxPolyDP(contour, 0.04 * peri, True)
+        v      = len(approx)
+
+        area      = cv2.contourArea(contour)
+        hull      = cv2.convexHull(contour)
+        hull_area = cv2.contourArea(hull)
+        solidity  = area / hull_area if hull_area > 0 else 1.0
+
+        # Stars are non-convex: solidity well below 0.65, vertex count ≥ 8
+        if solidity < 0.65 and v >= 8:
+            return "ESTRELA"
+
+        if v == 3:
+            return "TRIANGULO"
+
+        if 5 <= v <= 8:
+            return "HEXAGONO"
+
+        return "UNKNOWN"
+
+    # ------------------------------------------------------------------ #
+    #  NUMBER READING (inside a shape contour)                            #
+    # ------------------------------------------------------------------ #
+
+    def _classify_digit_345(self, thresh):
+        """
+        Classifies a binarised digit image (digit=white on black) as '3', '4', or '5'.
+
+        Strategy:
+          - '4' has exactly one enclosed hole (the triangular gap).  Detected via
+            RETR_CCOMP child-contour count.
+          - '5' has a full-width horizontal bar at the top.  Detected by checking
+            that more than 50 % of columns in the top 25 % of the ROI are non-empty.
+          - '3' is the remaining case (bumps on the right, no top bar, no hole).
+        """
+        h, w = thresh.shape[:2]
+        if h == 0 or w == 0:
+            return None
+
+        cnts, hierarchy = cv2.findContours(thresh.copy(), cv2.RETR_CCOMP,
+                                           cv2.CHAIN_APPROX_SIMPLE)
+        if hierarchy is None or len(cnts) == 0:
+            return None
+
+        # Count holes = contours that have a parent (hierarchy[][3] != -1)
+        holes = sum(1 for row in hierarchy[0] if row[3] != -1)
+        if holes >= 1:
+            return '4'
+
+        # Distinguish 3 vs 5: check horizontal span of top-quarter pixels.
+        top = thresh[:max(1, h // 4), :]
+        filled_cols = int(np.sum(np.any(top > 0, axis=0)))
+        if filled_cols > w * 0.5:
+            return '5'
+        return '3'
+
+    def read_number_in_contour(self, frame, contour):
+        """
+        Crops the interior of a detected shape and reads the digit ('3','4','5')
+        written inside.
+
+        Priority:
+          1. EasyOCR   — most robust, model-based
+          2. pytesseract — lighter, works when easyocr is not installed
+          3. Contour analysis — pure-OpenCV fallback (no extra dependencies)
+
+        Returns the digit as a string, or None if unreadable.
+        """
+        x, y, w, h = cv2.boundingRect(contour)
+        margin = max(5, min(w, h) // 6)   # shrink inward past the shape border
+        x1 = max(0, x + margin)
+        y1 = max(0, y + margin)
+        x2 = min(frame.shape[1], x + w - margin)
+        y2 = min(frame.shape[0], y + h - margin)
+        if x2 <= x1 or y2 <= y1:
+            return None
+
+        roi  = frame[y1:y2, x1:x2]
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY) if roi.ndim == 3 else roi
+
+        # Upscale small ROIs so the digit has enough pixels for OCR
+        scale = max(1, 80 // min(gray.shape[:2]))
+        if scale > 1:
+            gray = cv2.resize(gray, None, fx=scale, fy=scale,
+                              interpolation=cv2.INTER_CUBIC)
+
+        _, thresh = cv2.threshold(gray, 0, 255,
+                                  cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+        # --- 1. EasyOCR (primary) ----------------------------------------
+        if self._ocr is not None:
+            results = self._ocr.readtext(thresh, allowlist='345',
+                                         detail=1, paragraph=False)
+            for (_, text, conf) in results:
+                if conf > 0.4:
+                    for c in text.strip():
+                        if c in '345':
+                            return c
+
+        # --- 2. pytesseract (secondary) ----------------------------------
+        if PYTESSERACT_AVAILABLE:
+            text = pytesseract.image_to_string(
+                thresh,
+                config='--psm 10 --oem 3 -c tessedit_char_whitelist=345'
+            )
+            for c in text.strip():
+                if c in '345':
+                    return c
+
+        # --- 3. Contour-based classification (fallback) ------------------
+        return self._classify_digit_345(thresh)
+
+    # ------------------------------------------------------------------ #
+    #  MAIN CALLBACK                                                       #
+    # ------------------------------------------------------------------ #
+
+    def image_callback(self, msg):
+        try:
+            frame = self.br.compressed_imgmsg_to_cv2(msg, desired_encoding='bgr8')
+        except Exception as e:
+            self.get_logger().error(f'Failed to convert image: {e}')
+            return
+
+        height, width = frame.shape[:2]
+        output_frame  = frame.copy()
+
+        det_msg = BouncingDetection()
+        det_msg.header = msg.header
+
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+        # ---- 1. ArUco detection ----------------------------------------
+        corners, ids, _ = aruco.detectMarkers(gray, self.aruco_dict,
+                                              parameters=self.aruco_params)
+
+        if ids is not None and len(ids) > 0:
+            aruco.drawDetectedMarkers(output_frame, corners, ids)
+
+            c  = corners[0][0]
+            cx = (c[0][0] + c[2][0]) / 2.0
+            cy = (c[0][1] + c[2][1]) / 2.0
+
+            det_msg.aruco_detected = True
+            det_msg.aruco_id       = int(ids[0][0])
+            det_msg.aruco_x_error  = float((cx - width  / 2.0) / (width  / 2.0))
+            det_msg.aruco_y_error  = float((cy - height / 2.0) / (height / 2.0))
+
+            # ---- 2. Detect the shape surrounding the ArUco (gabarito) --
+            blurred  = cv2.GaussianBlur(gray, (5, 5), 0)
+            edges    = cv2.Canny(blurred, 50, 150)
+            contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL,
+                                           cv2.CHAIN_APPROX_SIMPLE)
+
+            aruco_shape = "UNKNOWN"
+            for cnt in sorted(contours, key=cv2.contourArea, reverse=True):
+                if cv2.contourArea(cnt) < 500:
+                    continue
+                shape = self.detect_shape(cnt)
+                if shape == "UNKNOWN":
+                    continue
+                M = cv2.moments(cnt)
+                if M['m00'] == 0:
+                    continue
+                scx = int(M['m10'] / M['m00'])
+                scy = int(M['m01'] / M['m00'])
+                if abs(scx - cx) < 150 and abs(scy - cy) < 150:
+                    aruco_shape = shape
+                    cv2.putText(output_frame, f"GABARITO: {shape}",
+                                (scx, scy - 10), cv2.FONT_HERSHEY_SIMPLEX,
+                                0.5, (0, 255, 0), 2)
+                    break
+
+            det_msg.aruco_shape = aruco_shape
+
+            # ---- 3. Apply divisibility rule → target base ID -----------
+            #
+            # The correct landing base has:
+            #   (a) the same shape as the gabarito  (= aruco_shape)
+            #   (b) the number written inside it divides aruco_id
+            #
+            # target_base encodes both as "SHAPE_NUMBER" (e.g. "HEXAGONO_4")
+            # so base detection can match unambiguously.
+            if aruco_shape != "UNKNOWN":
+                target_number = self.calculate_target_number(det_msg.aruco_id)
+                if target_number is not None:
+                    det_msg.target_calculated = True
+                    det_msg.target_base = f"{aruco_shape}_{target_number}"
+                    cv2.putText(output_frame, f"TARGET: {det_msg.target_base}",
+                                (20, 40), cv2.FONT_HERSHEY_SIMPLEX,
+                                1.0, (255, 0, 0), 2)
+
+        # Latch the target so base matching keeps working when ArUco is not visible
+        if det_msg.target_calculated:
+            self._cached_target_calculated = True
+            self._cached_target_base = det_msg.target_base
+        elif self._cached_target_calculated:
+            det_msg.target_calculated = True
+            det_msg.target_base = self._cached_target_base
+
+        # ---- 4. Landing base detection ----------------------------------
+        blurred2    = cv2.GaussianBlur(gray, (5, 5), 0)
+        edges2      = cv2.Canny(blurred2, 50, 150)
+        base_cnts, _ = cv2.findContours(edges2, cv2.RETR_EXTERNAL,
+                                        cv2.CHAIN_APPROX_SIMPLE)
+
+        visible_bases   = []
+        visible_bases_x = []
+        visible_bases_y = []
+
+        for cnt in base_cnts:
+            if cv2.contourArea(cnt) < 500:
+                continue
+            shape = self.detect_shape(cnt)
+            if shape == "UNKNOWN":
+                continue
+
+            M = cv2.moments(cnt)
+            if M['m00'] == 0:
+                continue
+            bcx = int(M['m10'] / M['m00'])
+            bcy = int(M['m01'] / M['m00'])
+            bx_err = float((bcx - width  / 2.0) / (width  / 2.0))
+            by_err = float((bcy - height / 2.0) / (height / 2.0))
+
+            # Read the number written inside this base's shape
+            number  = self.read_number_in_contour(frame, cnt)
+            base_id = f"{shape}_{number}" if number else shape
+
+            visible_bases.append(base_id)
+            visible_bases_x.append(bx_err)
+            visible_bases_y.append(by_err)
+
+            cv2.circle(output_frame, (bcx, bcy), 10, (255, 255, 0), -1)
+            cv2.putText(output_frame, f"BASE {base_id}",
+                        (bcx - 30, bcy - 15), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5, (255, 255, 0), 2)
+
+            # Match against the target (exact match, then soft match by shape)
+            if det_msg.target_calculated and base_id == det_msg.target_base:
+                det_msg.target_base_in_sight = True
+                det_msg.target_base_x_error  = bx_err
+                det_msg.target_base_y_error  = by_err
+                cv2.circle(output_frame, (bcx, bcy), 20, (0, 0, 255), 3)
+            elif (det_msg.target_calculated
+                  and not det_msg.target_base_in_sight
+                  and number is None
+                  and shape == det_msg.target_base.split('_')[0]):
+                # OCR could not read the digit but the shape is correct — navigate toward it
+                self.get_logger().warn(
+                    f'Soft match: {shape} seen but number unreadable '
+                    f'(target={det_msg.target_base}) — using position anyway')
+                det_msg.target_base_in_sight = True
+                det_msg.target_base_x_error  = bx_err
+                det_msg.target_base_y_error  = by_err
+                cv2.circle(output_frame, (bcx, bcy), 20, (0, 165, 255), 3)
+
+        det_msg.visible_bases         = visible_bases
+        det_msg.visible_bases_x_error = visible_bases_x
+        det_msg.visible_bases_y_error = visible_bases_y
+
+        self.publisher_.publish(det_msg)
+
+        try:
+            debug_msg = self.br.cv2_to_compressed_imgmsg(output_frame)
+            debug_msg.header = msg.header
+            self.debug_pub_.publish(debug_msg)
+        except Exception as e:
+            self.get_logger().error(f'Failed to publish debug image: {e}')
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = BouncingDetectorNode()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.try_shutdown()
+
+
+if __name__ == '__main__':
+    main()
