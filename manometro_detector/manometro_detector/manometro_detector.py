@@ -2,21 +2,23 @@ import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import CompressedImage
 from std_msgs.msg import Float32, Int16MultiArray
+from geometry_msgs.msg import Point
 from cv_bridge import CvBridge
 
 import cv2 as cv
 import numpy as np
 import os
+import time
 
 # Configurações
 TEMPLATE_SIZE = 400          # Side length (px) for the canonical square
 DIFF_BLUR_KSIZE = 7          # (Median) Blur kernel for diff cleanup
 DIFF_THRESHOLD = 30          # Threshold applied after blur on the diff image
 EPSILON_RAMER_DOUGLAS_PEUCKER = 0.04 # Valor do epsilon para o algoritmo de RDP
-ROI_RADIUS_RATIO = 0.30      # Define a ROI interna (para ignorar os números da borda)
-ROI_OFFSET_Y = -20           # Deslocamento vertical do centro da ROI
+ROI_RADIUS_RATIO = 0.40      # Define a ROI interna (cobre o ponteiro sem incluir números da borda)
+ROI_OFFSET_Y = -20           # Deslocamento vertical do centro da ROI (cabinho da moldura)
 ROI_OFFSET_X = 0             # Deslocamento horizontal do centro da ROI
-MAX_POINTER_PIXELS = 2500    # Limite máximo de pixels brancos (ruído). Acima disso = Miss Detection
+MAX_POINTER_PIXELS = 50000    # Limite máximo de pixels brancos (ruído). Acima disso = Miss Detection
 
 # Angle (degrees, math convention: 0=right, CCW positive) observed when the
 # pointer is at the 0-pressure and 100-pressure marks.
@@ -322,15 +324,16 @@ def correct_angle_homography(angle_deg, warped_bin):
     return np.degrees(real_rad)
 
 
-def angle_to_pressure(angle_deg):
+def angle_to_pressure(angle_deg, angle_at_0=ANGLE_AT_0, angle_at_100=ANGLE_AT_100):
     """
     Map detected pointer angle to pressure value (0–100).
     Uses a linear interpolation between the two calibrated angles.
+    Calibration: set angle_at_0 / angle_at_100 via ROS2 params.
     """
-    # Normalize angles so the sweep is monotonically decreasing
-    # from ANGLE_AT_0 (225°) to ANGLE_AT_100 (-45° = 315° CW)
-    sweep = ANGLE_AT_0 - ANGLE_AT_100   # total angular sweep (positive)
-    fraction = (ANGLE_AT_0 - angle_deg) / sweep
+    sweep = angle_at_0 - angle_at_100   # total angular sweep
+    if sweep == 0:
+        return 0.0
+    fraction = (angle_at_0 - angle_deg) / sweep
     pressure = fraction * 100.0
     return np.clip(pressure, 0.0, 100.0)
 
@@ -359,6 +362,20 @@ class ManometroDetector(Node):
             10 # QoS
         )
 
+        self.debug_pub = self.create_publisher(
+            CompressedImage,
+            '/manometro_debug/compressed',
+            10
+        )
+
+        # Normalized pixel error [-1, 1] for XY alignment.
+        # Published every frame: NaN when manometer not detected.
+        self.error_pub = self.create_publisher(
+            Point,
+            '/manometer_error',
+            10
+        )
+
         # Load template
         assets_dir = os.path.join(os.path.dirname(__file__), 'assets')
         template_path = os.path.join(assets_dir, 'template2.png')
@@ -377,19 +394,78 @@ class ManometroDetector(Node):
         if self.template_radius is None:
             self.get_logger().warn("Circle not found in template. Resize alignment might fail.")
 
+        # Calibration: angular positions of 0% and 100% pressure on the dial.
+        # Override via ROS2 params (or YAML) without recompiling.
+        self.declare_parameter('angle_at_0',   ANGLE_AT_0)
+        self.declare_parameter('angle_at_100', ANGLE_AT_100)
+        self._angle_at_0   = self.get_parameter('angle_at_0').value
+        self._angle_at_100 = self.get_parameter('angle_at_100').value
+
+        # Additional rotation offset in degrees applied AFTER the best_rot*90 correction.
+        # Use 0, 90, 180, or 270 to compensate for camera mounting orientation.
+        # Default 180: the debug inset was 180° off from the physical manometer.
+        self.declare_parameter('rotation_correction_deg', 180.0)
+        self._rot_corr = self.get_parameter('rotation_correction_deg').value
+
+        self.get_logger().info(
+            f'Calibration: angle_at_0={self._angle_at_0:.1f}  '
+            f'angle_at_100={self._angle_at_100:.1f}  '
+            f'rotation_correction={self._rot_corr:.0f}deg')
+
+        self._miss_log_time = 0.0   # throttle MISS DETECTION log (max 1/2s)
+        self._skip_log_time = 0.0   # throttle oversized-quad log
+
     def callback(self, msg):
         try:
             pressure = -1.0
-            
+
             frame = self.bridge.compressed_imgmsg_to_cv2(msg)
+            debug_frame = frame.copy()
 
             gray = cv.cvtColor(frame, cv.COLOR_BGR2GRAY)
             clahe = cv.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
             gray = clahe.apply(gray)
             _, binary = cv.threshold(gray, 0, 255, cv.THRESH_BINARY | cv.THRESH_OTSU)
 
-            corners, centro = find_square(binary)
-            if corners is not None:
+            centro = None
+            angle = None
+            pointer_mask_debug = None
+            warped_debug = None
+            best_rot_debug = 0
+            h_img, w_img = frame.shape[:2]
+            img_area = h_img * w_img
+
+            result = find_square(binary)
+            if result is not None:
+                corners, corner_sum = result
+                candidate_centro = (corner_sum / 4).astype(int)
+                quad_area = cv.contourArea(corners.astype(np.float32).reshape(4, 1, 2))
+
+                # Always draw candidate so the user can see what find_square found.
+                # Orange = candidate being evaluated; color changes later based on outcome.
+                cv.polylines(debug_frame, [corners.astype(int)], True, (0, 165, 255), 2)
+                cv.circle(debug_frame, tuple(candidate_centro), 4, (0, 165, 255), -1)
+                cv.putText(debug_frame, f"A={quad_area:.0f}",
+                           (int(corners[0][0]), int(corners[0][1]) - 6),
+                           cv.FONT_HERSHEY_SIMPLEX, 0.35, (0, 165, 255), 1)
+
+                # Area filter: 0.5% min (removes tiny noise), 70% max (removes horizon line)
+                if quad_area > 0.70 * img_area or quad_area < 0.005 * img_area:
+                    now = time.time()
+                    if now - self._skip_log_time >= 5.0:
+                        self.get_logger().warn(
+                            f"find_square: quadrilatero invalido ({quad_area:.0f} px2 vs "
+                            f"img {img_area} px2), ignorado")
+                        self._skip_log_time = now
+                    cv.putText(debug_frame, "REJ",
+                               (int(candidate_centro[0]) - 15, int(candidate_centro[1])),
+                               cv.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 200), 1)
+                    result = None
+
+            if result is not None:
+                corners, corner_sum = result
+                candidate_centro = (corner_sum / 4).astype(int)
+
                 warped = warp_to_square(gray, corners, TEMPLATE_SIZE)
                 _, warped_bin = cv.threshold(warped, 0, 255, cv.THRESH_BINARY | cv.THRESH_OTSU)
 
@@ -397,23 +473,20 @@ class ManometroDetector(Node):
                 best_diff_val = -1
                 best_mask = None
                 best_warped_bin = None
-                
-                # Detect circle in warped image for radius matching
+                best_rot = 0  # track selected rotation to correct angle back to original frame
+
                 warped_radius, _ = get_circle_params(warped_bin)
-                # Adjust template to match warped image circle size
                 adj_template_bin = adjust_template(self.template_bin, warped_radius, self.template_radius)
-                
-                # Test 0, 90, 180, 270 degrees
+
                 for rot in range(4):
                     rotated_warped = np.rot90(warped_bin, rot)
                     diff, mask = isolate_pointer(rotated_warped, adj_template_bin)
-                    
-                    # The correct rotation and scale should have the greatest difference
                     diff_val = np.sum(diff)
                     if diff_val > best_diff_val:
                         best_diff_val = diff_val
                         best_mask = mask
                         best_warped_bin = rotated_warped
+                        best_rot = rot
 
                 pointer_mask = best_mask
 
@@ -422,37 +495,133 @@ class ManometroDetector(Node):
                     r_mask, c_mask = get_circle_params(best_warped_bin)
                     if r_mask is not None and c_mask is not None:
                         c_mask_img = np.zeros_like(pointer_mask)
-                        # Ajusta o centro da ROI usando os offsets configurados
                         adjusted_center = (c_mask[0] + ROI_OFFSET_X, c_mask[1] + ROI_OFFSET_Y)
-                        # Aplica o raio da ROI (Region of Interest) para ignorar sujeiras nas bordas
                         cv.circle(c_mask_img, adjusted_center, int(r_mask * ROI_RADIUS_RATIO), 255, -1)
                         pointer_mask = cv.bitwise_and(pointer_mask, c_mask_img)
 
-                # Angle detection
-                angle = None
+                # CRITICAL: only confirm detection when template subtraction passes.
+                # centro stays None for MISS cases → /manometer_error publishes NaN.
                 if best_mask is not None:
-                    # Conta a "massa" de pixels brancos (ruído / ponteiro)
                     white_pixels = cv.countNonZero(pointer_mask)
-                    
                     if white_pixels > MAX_POINTER_PIXELS:
-                        self.get_logger().warn(f"MISS DETECTION: Excesso de ruído absoluto - {white_pixels} px")
+                        now = time.time()
+                        if now - self._miss_log_time >= 2.0:
+                            self.get_logger().warn(
+                                f"MISS DETECTION: {white_pixels} px — nao e manometro")
+                            self._miss_log_time = now
+                        cv.putText(debug_frame, "MISS",
+                                   (int(candidate_centro[0]) - 20, int(candidate_centro[1])),
+                                   cv.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 200), 1)
                     else:
-                        angle, centroid = pointer_angle_pca(pointer_mask)
-                        #angle, centroid = pointer_angle_moments(pointer_mask)
-                        #angle, centroid = pointer_angle_hough(pointer_mask)
-                        
-                if angle is not None:
-                        # Correcao do angulo
-                        angle = correct_angle_homography(angle, best_warped_bin)
-                        pressure = angle_to_pressure(angle)
-                        
-            # Publica a pressao como Float32 (valor real ou -1.0 se falhou)
+                        # Valid manometer detection — confirm and draw in green
+                        centro = candidate_centro
+                        cv.polylines(debug_frame, [corners.astype(int)], True, (0, 255, 0), 3)
+                        for pt in corners:
+                            cv.circle(debug_frame, (int(pt[0]), int(pt[1])), 7, (0, 220, 0), -1)
+                        cv.circle(debug_frame, tuple(centro), 5, (255, 0, 0), -1)
+                        cv.putText(debug_frame, "MANOMETRO",
+                                   (int(corners[0][0]), int(corners[0][1]) - 10),
+                                   cv.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+
+                        angle, _ = pointer_angle_pca(pointer_mask)
+                        if angle is not None:
+                            angle = correct_angle_homography(angle, best_warped_bin)
+                            # Undo the np.rot90 rotation and apply the mounting offset.
+                            angle = angle + best_rot * 90.0 + self._rot_corr
+                            angle = ((angle + 180.0) % 360.0) - 180.0
+                            pressure = angle_to_pressure(
+                                angle, self._angle_at_0, self._angle_at_100)
+                            pointer_mask_debug = pointer_mask.copy()
+                            warped_debug = best_warped_bin.copy()
+                            best_rot_debug = best_rot
+
+                            self.get_logger().info(
+                                f'[manometro] pressao={pressure:.1f}  '
+                                f'angulo={angle:.1f}deg  rot={best_rot}')
+
+                            side_len = float(np.linalg.norm(
+                                corners[0].astype(float) - corners[1].astype(float)))
+                            arrow_len = int(side_len * 0.35)
+                            ax = int(centro[0] + arrow_len * np.cos(np.radians(angle)))
+                            ay = int(centro[1] - arrow_len * np.sin(np.radians(angle)))
+                            cv.arrowedLine(debug_frame, tuple(centro), (ax, ay),
+                                           (0, 0, 255), 3, tipLength=0.3)
+
+            # ── Pressure + angle overlay (top-left banner) ──────────────────
+            h_frame, w_frame = debug_frame.shape[:2]
+            cv.rectangle(debug_frame, (0, 0), (340, 60), (0, 0, 0), -1)
+            if pressure >= 0:
+                cv.putText(debug_frame, f"Pressao: {pressure:.1f}",
+                           (10, 30), cv.FONT_HERSHEY_SIMPLEX, 0.9, (0, 230, 0), 2)
+                cv.putText(debug_frame, f"Angulo:  {angle:.1f} deg",
+                           (10, 55), cv.FONT_HERSHEY_SIMPLEX, 0.6, (180, 180, 180), 1)
+            else:
+                cv.putText(debug_frame, "Pressao: --",
+                           (10, 38), cv.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 220), 2)
+
+            # ── Mini-inset: binary threshold (bottom-left) ──────────────────
+            inset_size = min(160, h_frame // 4, w_frame // 4)
+            bin_small = cv.resize(binary, (inset_size, inset_size))
+            bin_bgr = cv.cvtColor(bin_small, cv.COLOR_GRAY2BGR)
+            cv.putText(bin_bgr, "bin", (2, 12), cv.FONT_HERSHEY_SIMPLEX, 0.4, (100, 255, 100), 1)
+            debug_frame[h_frame - inset_size:h_frame, 0:inset_size] = bin_bgr
+
+            # ── Mini-inset: manômetro normalizado + seta do ângulo detectado ──
+            # The image is rotated by rotation_correction_deg so it shows the
+            # same orientation as the physical manometer (right-side up).
+            if warped_debug is not None and angle is not None:
+                inset_size = min(160, h_frame // 3, w_frame // 3)
+                # Apply the mounting correction to the display image
+                extra_k = int(round(self._rot_corr / 90.0)) % 4
+                warped_display = np.rot90(warped_debug, extra_k)
+                warped_color = cv.cvtColor(
+                    cv.resize(warped_display, (inset_size, inset_size)), cv.COLOR_GRAY2BGR)
+                cx_i = inset_size // 2
+                cy_i = inset_size // 2
+                line_len = int(inset_size * 0.40)
+                # The inset image is rotated by (best_rot + extra_k)*90° from warped_bin.
+                # The arrow must be expressed in the inset's own coordinate frame:
+                #   angle_inset = angle - (best_rot + extra_k) * 90
+                angle_for_inset = angle - (best_rot_debug + extra_k) * 90.0
+                angle_for_inset = ((angle_for_inset + 180.0) % 360.0) - 180.0
+                lx = int(cx_i + line_len * np.cos(np.radians(angle_for_inset)))
+                ly = int(cy_i - line_len * np.sin(np.radians(angle_for_inset)))
+                cv.arrowedLine(warped_color, (cx_i, cy_i), (lx, ly), (0, 0, 255), 2, tipLength=0.3)
+                cv.putText(warped_color, f"{angle:.0f}d r{best_rot_debug}", (2, 12),
+                           cv.FONT_HERSHEY_SIMPLEX, 0.35, (0, 200, 255), 1)
+                cv.rectangle(warped_color, (0, 0), (inset_size - 1, inset_size - 1), (0, 0, 200), 2)
+                x0 = w_frame - inset_size
+                y0 = h_frame - inset_size
+                debug_frame[y0:h_frame, x0:w_frame] = warped_color
+
+            # Publish pressure
             msg_out = Float32()
             msg_out.data = float(pressure)
             self.pressure_pub.publish(msg_out)
 
-            position = Int16MultiArray()
-            position.data = [centro[0], centro[1]]
+            # Publish manometer center position (only when detected)
+            if centro is not None:
+                position = Int16MultiArray()
+                position.data = [int(centro[0]), int(centro[1])]
+                self.position_manometro.publish(position)
+
+            # Publish normalized XY error for alignment controller
+            err_msg = Point()
+            if centro is not None:
+                err_msg.x = float(centro[0] - w_img / 2.0) / (w_img / 2.0)
+                err_msg.y = float(centro[1] - h_img / 2.0) / (h_img / 2.0)
+            else:
+                err_msg.x = float('nan')
+                err_msg.y = float('nan')
+            self.error_pub.publish(err_msg)
+
+            # Publish debug image
+            try:
+                debug_msg = self.bridge.cv2_to_compressed_imgmsg(debug_frame)
+                debug_msg.header = msg.header
+                self.debug_pub.publish(debug_msg)
+            except Exception as e:
+                self.get_logger().error(f"Failed to publish debug image: {e}")
 
         except Exception as e:
             self.get_logger().error(f"Erro no callback de imagem: {str(e)}")
