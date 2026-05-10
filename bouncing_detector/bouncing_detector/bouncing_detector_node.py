@@ -6,6 +6,12 @@ from cv_bridge import CvBridge
 import cv2
 import cv2.aruco as aruco
 import numpy as np
+from rclpy.qos import (
+    QoSProfile,
+    QoSReliabilityPolicy,
+    QoSHistoryPolicy,
+    QoSDurabilityPolicy
+)
 
 try:
     import easyocr as _easyocr
@@ -40,10 +46,22 @@ class BouncingDetectorNode(Node):
         self.declare_parameter('vertical_camera_topic', '/vertical_camera/compressed')
         camera_topic = self.get_parameter('vertical_camera_topic').get_parameter_value().string_value
 
+        qos = QoSProfile(
+            history=QoSHistoryPolicy.KEEP_LAST,
+            depth=5,
+            reliability=QoSReliabilityPolicy.BEST_EFFORT,
+            durability=QoSDurabilityPolicy.VOLATILE
+        )
+
         self.publisher_  = self.create_publisher(BouncingDetection, 'bouncing_detection', 10)
-        self.debug_pub_  = self.create_publisher(CompressedImage, 'bouncing_detection_image/compressed', 10)
+        self.debug_pub_  = self.create_publisher(CompressedImage, 'bouncing_detection_image/compressed', qos)
+
         self.subscription = self.create_subscription(
-            CompressedImage, camera_topic, self.image_callback, 10)
+            CompressedImage,
+            camera_topic,
+            self.image_callback,
+            qos
+        )
 
         self.br = CvBridge()
         self.aruco_dict   = aruco.getPredefinedDictionary(aruco.DICT_5X5_100)
