@@ -195,6 +195,14 @@ class BouncingDetectorNode(Node):
         _, thresh = cv2.threshold(gray, 0, 255,
                                   cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
 
+        # Restrict OCR to pixels strictly inside the shape contour so that
+        # digits from adjacent bases don't bleed into this shape's analysis.
+        contour_local = ((contour.reshape(-1, 2) - np.array([x1, y1])) * scale
+                         ).reshape(-1, 1, 2).astype(np.int32)
+        shape_mask = np.zeros(thresh.shape[:2], dtype=np.uint8)
+        cv2.drawContours(shape_mask, [contour_local], -1, 255, cv2.FILLED)
+        thresh = cv2.bitwise_and(thresh, thresh, mask=shape_mask)
+
         # --- 1. EasyOCR (primary) ----------------------------------------
         if self._ocr is not None:
             results = self._ocr.readtext(thresh, allowlist='345',
@@ -353,14 +361,18 @@ class BouncingDetectorNode(Node):
                   and not det_msg.target_base_in_sight
                   and number is None
                   and shape == det_msg.target_base.split('_')[0]):
-                # OCR could not read the digit but the shape is correct — navigate toward it
-                self.get_logger().warn(
-                    f'Soft match: {shape} seen but number unreadable '
-                    f'(target={det_msg.target_base}) — using position anyway')
-                det_msg.target_base_in_sight = True
-                det_msg.target_base_x_error  = bx_err
-                det_msg.target_base_y_error  = by_err
-                cv2.circle(output_frame, (bcx, bcy), 20, (0, 165, 255), 3)
+                # Only soft-match when no other base of the same shape has a readable
+                # number — avoids navigating toward the wrong base in multi-base scenes.
+                same_shape_readable = [b for b in visible_bases
+                                       if b.startswith(shape + '_')]
+                if not same_shape_readable:
+                    self.get_logger().warn(
+                        f'Soft match: {shape} seen but number unreadable '
+                        f'(target={det_msg.target_base}) — using position anyway')
+                    det_msg.target_base_in_sight = True
+                    det_msg.target_base_x_error  = bx_err
+                    det_msg.target_base_y_error  = by_err
+                    cv2.circle(output_frame, (bcx, bcy), 20, (0, 165, 255), 3)
 
         det_msg.visible_bases         = visible_bases
         det_msg.visible_bases_x_error = visible_bases_x
