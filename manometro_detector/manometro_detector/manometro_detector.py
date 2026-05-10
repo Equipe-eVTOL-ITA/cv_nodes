@@ -1,7 +1,7 @@
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import CompressedImage
-from std_msgs.msg import Float32, Int16MultiArray
+from std_msgs.msg import Float32, Int16MultiArray, String
 from geometry_msgs.msg import Point
 from cv_bridge import CvBridge
 
@@ -9,6 +9,7 @@ import cv2 as cv
 import numpy as np
 import os
 import time
+from datetime import datetime
 
 # Configurações
 TEMPLATE_SIZE = 400          # Side length (px) for the canonical square
@@ -404,7 +405,7 @@ class ManometroDetector(Node):
         # Additional rotation offset in degrees applied AFTER the best_rot*90 correction.
         # Use 0, 90, 180, or 270 to compensate for camera mounting orientation.
         # Default 180: the debug inset was 180° off from the physical manometer.
-        self.declare_parameter('rotation_correction_deg', 180.0)
+        self.declare_parameter('rotation_correction_deg', 0.0)
         self._rot_corr = self.get_parameter('rotation_correction_deg').value
 
         self.get_logger().info(
@@ -412,8 +413,27 @@ class ManometroDetector(Node):
             f'angle_at_100={self._angle_at_100:.1f}  '
             f'rotation_correction={self._rot_corr:.0f}deg')
 
-        self._miss_log_time = 0.0   # throttle MISS DETECTION log (max 1/2s)
-        self._skip_log_time = 0.0   # throttle oversized-quad log
+        self._miss_log_time  = 0.0
+        self._skip_log_time  = 0.0
+        self._latest_debug_frame = None  # most recent annotated frame for saving
+
+        # Subscribe to pressure analysis to trigger image saving
+        self._save_dir = os.path.expanduser('~/evtol/manometro_readings')
+        os.makedirs(self._save_dir, exist_ok=True)
+        self.create_subscription(
+            String, '/pressure_analysis', self._save_callback, 10)
+
+    def _save_callback(self, msg):
+        """Save the annotated debug frame when a pressure measurement is published."""
+        if not msg.data or self._latest_debug_frame is None:
+            return
+        is_above = 'above' in msg.data
+        label    = 'ACIMA_DO_LIMITE' if is_above else 'DENTRO_DO_LIMITE'
+        ts       = datetime.now().strftime('%Y%m%d_%H%M%S')
+        filename = f'manometro_{ts}_{label}.jpg'
+        path     = os.path.join(self._save_dir, filename)
+        cv.imwrite(path, self._latest_debug_frame)
+        self.get_logger().info(f'[foto] Salva em {path}')
 
     def callback(self, msg):
         try:
@@ -469,11 +489,13 @@ class ManometroDetector(Node):
                 warped = warp_to_square(gray, corners, TEMPLATE_SIZE)
                 _, warped_bin = cv.threshold(warped, 0, 255, cv.THRESH_BINARY | cv.THRESH_OTSU)
 
-                # Template subtraction (Radius Alignment + 4 rotations)
-                best_diff_val = -1
+                # Template subtraction (Radius Alignment + 4 rotations).
+                # Select the rotation with MINIMUM diff: correct alignment cancels the
+                # background, leaving only the pointer pixels in the diff.
+                best_diff_val = float('inf')
                 best_mask = None
                 best_warped_bin = None
-                best_rot = 0  # track selected rotation to correct angle back to original frame
+                best_rot = 0  # index of the selected rotation (for display/logging)
 
                 warped_radius, _ = get_circle_params(warped_bin)
                 adj_template_bin = adjust_template(self.template_bin, warped_radius, self.template_radius)
@@ -482,7 +504,7 @@ class ManometroDetector(Node):
                     rotated_warped = np.rot90(warped_bin, rot)
                     diff, mask = isolate_pointer(rotated_warped, adj_template_bin)
                     diff_val = np.sum(diff)
-                    if diff_val > best_diff_val:
+                    if diff_val < best_diff_val:
                         best_diff_val = diff_val
                         best_mask = mask
                         best_warped_bin = rotated_warped
@@ -526,8 +548,8 @@ class ManometroDetector(Node):
                         angle, _ = pointer_angle_pca(pointer_mask)
                         if angle is not None:
                             angle = correct_angle_homography(angle, best_warped_bin)
-                            # Undo the np.rot90 rotation and apply the mounting offset.
-                            angle = angle + best_rot * 90.0 + self._rot_corr
+                            # With correct (minimum-diff) rotation selected, the PCA angle
+                            # is already in the template's coordinate frame — no correction needed.
                             angle = ((angle + 180.0) % 360.0) - 180.0
                             pressure = angle_to_pressure(
                                 angle, self._angle_at_0, self._angle_at_100)
@@ -542,8 +564,11 @@ class ManometroDetector(Node):
                             side_len = float(np.linalg.norm(
                                 corners[0].astype(float) - corners[1].astype(float)))
                             arrow_len = int(side_len * 0.35)
-                            ax = int(centro[0] + arrow_len * np.cos(np.radians(angle)))
-                            ay = int(centro[1] - arrow_len * np.sin(np.radians(angle)))
+                            # The main frame is best_rot CCW rotations behind the template
+                            # frame: angle_main = angle + best_rot * 90
+                            angle_main = angle + best_rot * 90.0
+                            ax = int(centro[0] + arrow_len * np.cos(np.radians(angle_main)))
+                            ay = int(centro[1] - arrow_len * np.sin(np.radians(angle_main)))
                             cv.arrowedLine(debug_frame, tuple(centro), (ax, ay),
                                            (0, 0, 255), 3, tipLength=0.3)
 
@@ -579,13 +604,10 @@ class ManometroDetector(Node):
                 cx_i = inset_size // 2
                 cy_i = inset_size // 2
                 line_len = int(inset_size * 0.40)
-                # The inset image is rotated by (best_rot + extra_k)*90° from warped_bin.
-                # The arrow must be expressed in the inset's own coordinate frame:
-                #   angle_inset = angle - (best_rot + extra_k) * 90
-                angle_for_inset = angle - (best_rot_debug + extra_k) * 90.0
-                angle_for_inset = ((angle_for_inset + 180.0) % 360.0) - 180.0
-                lx = int(cx_i + line_len * np.cos(np.radians(angle_for_inset)))
-                ly = int(cy_i - line_len * np.sin(np.radians(angle_for_inset)))
+                # The angle is already in the template (= inset) coordinate frame,
+                # so the arrow is drawn directly at `angle`.
+                lx = int(cx_i + line_len * np.cos(np.radians(angle)))
+                ly = int(cy_i - line_len * np.sin(np.radians(angle)))
                 cv.arrowedLine(warped_color, (cx_i, cy_i), (lx, ly), (0, 0, 255), 2, tipLength=0.3)
                 cv.putText(warped_color, f"{angle:.0f}d r{best_rot_debug}", (2, 12),
                            cv.FONT_HERSHEY_SIMPLEX, 0.35, (0, 200, 255), 1)
@@ -614,6 +636,9 @@ class ManometroDetector(Node):
                 err_msg.x = float('nan')
                 err_msg.y = float('nan')
             self.error_pub.publish(err_msg)
+
+            # Store latest frame for saving when pressure_analysis fires
+            self._latest_debug_frame = debug_frame.copy()
 
             # Publish debug image
             try:

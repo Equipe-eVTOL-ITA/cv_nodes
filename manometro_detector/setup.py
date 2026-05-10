@@ -27,7 +27,8 @@ setup(
     },
     entry_points={
         'console_scripts': [
-            'manometro_detector = manometro_detector.manometro_detector:main'
+            'manometro_detector = manometro_detector.manometro_detector:main',
+            'audio_alert_node   = manometro_detector.audio_alert_node:main',
         ],
     },
 )
