@@ -132,61 +132,61 @@ class BouncingDetectorNode(Node):
 
     def _classify_digit_345(self, thresh):
         """
-        Classifies a binarised digit image (digit=white on black) as '3', '4', or '5'.
+        Classifies a binarised digit image (digit=white on black) as ('3'|'4'|'5', conf).
 
-        Strategy:
-          - '4' has exactly one enclosed hole (the triangular gap).  Detected via
-            RETR_CCOMP child-contour count.
-          - '5' has a full-width horizontal bar at the top.  Detected by checking
-            that more than 50 % of columns in the top 25 % of the ROI are non-empty.
-          - '3' is the remaining case (bumps on the right, no top bar, no hole).
+        Returns (digit_str, confidence) where confidence reflects feature quality:
+          '4' — detected via enclosed hole (RETR_CCOMP); conf scales with hole completeness
+          '5' — full-width top bar; conf scales with bar coverage ratio
+          '3' — residual case; fixed conf 0.40 (weakest claim)
+        Returns (None, 0.0) on empty image.
         """
         h, w = thresh.shape[:2]
         if h == 0 or w == 0:
-            return None
+            return None, 0.0
 
         cnts, hierarchy = cv2.findContours(thresh.copy(), cv2.RETR_CCOMP,
                                            cv2.CHAIN_APPROX_SIMPLE)
         if hierarchy is None or len(cnts) == 0:
-            return None
+            return None, 0.0
 
-        # Count holes = contours that have a parent (hierarchy[][3] != -1)
         holes = sum(1 for row in hierarchy[0] if row[3] != -1)
         if holes >= 1:
-            return '4'
+            # Confidence: saturate at 1 hole (expected for '4')
+            conf = min(1.0, 0.55 + holes * 0.2)
+            return '4', conf
 
-        # Distinguish 3 vs 5: check horizontal span of top-quarter pixels.
         top = thresh[:max(1, h // 4), :]
         filled_cols = int(np.sum(np.any(top > 0, axis=0)))
-        if filled_cols > w * 0.5:
-            return '5'
-        return '3'
+        bar_ratio = filled_cols / max(w, 1)
+        if bar_ratio > 0.5:
+            conf = min(1.0, 0.45 + bar_ratio * 0.5)
+            return '5', conf
+
+        return '3', 0.40
 
     def read_number_in_contour(self, frame, contour):
         """
-        Crops the interior of a detected shape and reads the digit ('3','4','5')
-        written inside.
+        Reads the digit ('3','4','5') inside a detected shape.
 
-        Priority:
-          1. EasyOCR   — most robust, model-based
-          2. pytesseract — lighter, works when easyocr is not installed
-          3. Contour analysis — pure-OpenCV fallback (no extra dependencies)
-
-        Returns the digit as a string, or None if unreadable.
+        Returns (digit_str, confidence) where confidence ∈ [0, 1]:
+          EasyOCR high (conf > 0.7)  → 0.90
+          EasyOCR mid  (conf 0.4-0.7) → 0.65
+          pytesseract                 → 0.55
+          contour classification      → 0.20 – 0.70 (feature-based)
+          not readable                → (None, 0.0)
         """
         x, y, w, h = cv2.boundingRect(contour)
-        margin = max(5, min(w, h) // 6)   # shrink inward past the shape border
+        margin = max(5, min(w, h) // 6)
         x1 = max(0, x + margin)
         y1 = max(0, y + margin)
         x2 = min(frame.shape[1], x + w - margin)
         y2 = min(frame.shape[0], y + h - margin)
         if x2 <= x1 or y2 <= y1:
-            return None
+            return None, 0.0
 
         roi  = frame[y1:y2, x1:x2]
         gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY) if roi.ndim == 3 else roi
 
-        # Upscale small ROIs so the digit has enough pixels for OCR
         scale = max(1, 80 // min(gray.shape[:2]))
         if scale > 1:
             gray = cv2.resize(gray, None, fx=scale, fy=scale,
@@ -195,8 +195,6 @@ class BouncingDetectorNode(Node):
         _, thresh = cv2.threshold(gray, 0, 255,
                                   cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
 
-        # Restrict OCR to pixels strictly inside the shape contour so that
-        # digits from adjacent bases don't bleed into this shape's analysis.
         contour_local = ((contour.reshape(-1, 2) - np.array([x1, y1])) * scale
                          ).reshape(-1, 1, 2).astype(np.int32)
         shape_mask = np.zeros(thresh.shape[:2], dtype=np.uint8)
@@ -207,11 +205,12 @@ class BouncingDetectorNode(Node):
         if self._ocr is not None:
             results = self._ocr.readtext(thresh, allowlist='345',
                                          detail=1, paragraph=False)
-            for (_, text, conf) in results:
-                if conf > 0.4:
+            for (_, text, ocr_conf) in results:
+                if ocr_conf > 0.4:
                     for c in text.strip():
                         if c in '345':
-                            return c
+                            conf = 0.90 if ocr_conf > 0.7 else 0.65
+                            return c, conf
 
         # --- 2. pytesseract (secondary) ----------------------------------
         if PYTESSERACT_AVAILABLE:
@@ -221,10 +220,11 @@ class BouncingDetectorNode(Node):
             )
             for c in text.strip():
                 if c in '345':
-                    return c
+                    return c, 0.55
 
         # --- 3. Contour-based classification (fallback) ------------------
-        return self._classify_digit_345(thresh)
+        digit, conf = self._classify_digit_345(thresh)
+        return digit, conf
 
     # ------------------------------------------------------------------ #
     #  MAIN CALLBACK                                                       #
@@ -319,9 +319,10 @@ class BouncingDetectorNode(Node):
         base_cnts, _ = cv2.findContours(edges2, cv2.RETR_EXTERNAL,
                                         cv2.CHAIN_APPROX_SIMPLE)
 
-        visible_bases   = []
-        visible_bases_x = []
-        visible_bases_y = []
+        visible_bases      = []
+        visible_bases_x    = []
+        visible_bases_y    = []
+        visible_bases_conf = []
 
         for cnt in base_cnts:
             if cv2.contourArea(cnt) < 500:
@@ -338,16 +339,18 @@ class BouncingDetectorNode(Node):
             bx_err = float((bcx - width  / 2.0) / (width  / 2.0))
             by_err = float((bcy - height / 2.0) / (height / 2.0))
 
-            # Read the number written inside this base's shape
-            number  = self.read_number_in_contour(frame, cnt)
+            # Read the number + detection confidence
+            number, num_conf = self.read_number_in_contour(frame, cnt)
             base_id = f"{shape}_{number}" if number else shape
 
             visible_bases.append(base_id)
             visible_bases_x.append(bx_err)
             visible_bases_y.append(by_err)
+            visible_bases_conf.append(float(num_conf) if num_conf else 0.0)
 
             cv2.circle(output_frame, (bcx, bcy), 10, (255, 255, 0), -1)
-            cv2.putText(output_frame, f"BASE {base_id}",
+            cv2.putText(output_frame,
+                        f"BASE {base_id} ({num_conf:.2f})" if num_conf else f"BASE {base_id}",
                         (bcx - 30, bcy - 15), cv2.FONT_HERSHEY_SIMPLEX,
                         0.5, (255, 255, 0), 2)
 
@@ -361,8 +364,6 @@ class BouncingDetectorNode(Node):
                   and not det_msg.target_base_in_sight
                   and number is None
                   and shape == det_msg.target_base.split('_')[0]):
-                # Only soft-match when no other base of the same shape has a readable
-                # number — avoids navigating toward the wrong base in multi-base scenes.
                 same_shape_readable = [b for b in visible_bases
                                        if b.startswith(shape + '_')]
                 if not same_shape_readable:
@@ -374,9 +375,10 @@ class BouncingDetectorNode(Node):
                     det_msg.target_base_y_error  = by_err
                     cv2.circle(output_frame, (bcx, bcy), 20, (0, 165, 255), 3)
 
-        det_msg.visible_bases         = visible_bases
-        det_msg.visible_bases_x_error = visible_bases_x
-        det_msg.visible_bases_y_error = visible_bases_y
+        det_msg.visible_bases            = visible_bases
+        det_msg.visible_bases_x_error    = visible_bases_x
+        det_msg.visible_bases_y_error    = visible_bases_y
+        det_msg.visible_bases_confidence = visible_bases_conf
 
         self.publisher_.publish(det_msg)
 
