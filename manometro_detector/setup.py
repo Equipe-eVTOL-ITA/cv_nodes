@@ -9,7 +9,7 @@ setup(
     data_files=[
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
-        ('share/' + package_name, ['package.xml']),
+        ('share/' + package_name, ['package.xml'])
     ],
     package_data={
         package_name: ['assets/*.png', 'assets/*.svg'],
@@ -27,8 +27,7 @@ setup(
     },
     entry_points={
         'console_scripts': [
-            'manometro_detector = manometro_detector.manometro_detector:main',
-            'audio_alert_node   = manometro_detector.audio_alert_node:main',
+            'manometro_detector = manometro_detector.manometro_detector:main'
         ],
     },
 )

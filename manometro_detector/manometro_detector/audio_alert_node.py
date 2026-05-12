@@ -4,9 +4,12 @@ Audio alert node — run on the ground station (not the drone).
 Subscribes to /pressure_analysis and plays distinct audio when the
 manometer reading is above or below the competition limit.
 
-Audio files (WAV/OGG) are configured via ROS2 parameters:
-  audio_above_limit: /path/to/above.wav   (played when pressure > limit)
-  audio_below_limit: /path/to/below.wav   (played when pressure <= limit)
+Audio files (MP3) are configured via ROS2 parameters:
+  audio_above_limit: /path/to/above.mp3   (played when pressure > limit)
+  audio_below_limit: /path/to/below.mp3   (played when pressure <= limit)
+
+Requires 'mpg123' to be installed:
+  sudo apt install mpg123
 
 If the files are not found, falls back to espeak-ng TTS (requires
   sudo apt install espeak-ng).
@@ -14,8 +17,8 @@ If the files are not found, falls back to espeak-ng TTS (requires
 Run on the ground station:
   source /opt/ros/humble/setup.bash
   ros2 run manometro_detector audio_alert_node \
-    --ros-args -p audio_above_limit:=/path/above.wav \
-               -p audio_below_limit:=/path/below.wav
+    --ros-args -p audio_above_limit:=/path/above.mp3 \
+               -p audio_below_limit:=/path/below.mp3
 
 Make sure ROS_DOMAIN_ID matches the drone's value.
 """
@@ -61,9 +64,9 @@ class AudioAlertNode(Node):
         audio_file = self._audio_above if is_above else self._audio_below
 
         if audio_file and os.path.isfile(audio_file):
-            # Play configured WAV/OGG with paplay (PulseAudio)
+            # Play configured MP3 with mpg123
             subprocess.Popen(
-                ['paplay', audio_file],
+                ['mpg123', '-q', audio_file],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         else:
             # Fallback: text-to-speech via espeak-ng
