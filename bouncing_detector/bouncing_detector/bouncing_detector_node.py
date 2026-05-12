@@ -30,7 +30,7 @@ class BouncingDetectorNode(Node):
     def __init__(self):
         super().__init__('bouncing_detector_node')
 
-        # Initialise OCR reader once — loading the model on every frame would be too slow.
+        # Initialise OCR reader
         self._ocr = None
         if EASYOCR_AVAILABLE:
             self.get_logger().info('EasyOCR available — using it for digit reading.')
@@ -72,16 +72,12 @@ class BouncingDetectorNode(Node):
         self._cached_target_calculated = False
         self._cached_target_base = ''
 
-    # ------------------------------------------------------------------ #
-    #  DIVISIBILITY RULE  (SAE 2026 edital)                               #
-    # ------------------------------------------------------------------ #
-
+    
+    # Critério de divisibilidade
     def calculate_target_number(self, aruco_id):
         """
-        Returns '3', '4', or '5' — the number written inside the correct landing base.
-        Rule: the base whose number is an exact divisor of the ArUco ID.
-        Checks in descending order (5→4→3) as a tie-breaker for ambiguous IDs
-        (e.g. 60 is divisible by all three); competition IDs are expected to be unambiguous.
+        Returna '3', '4', or '5'
+        Verifica quais entre eles, em ordem decrescente, é divisor exato do id do ArUco.
         """
         for n in [5, 4, 3]:
             if aruco_id % n == 0:
@@ -89,10 +85,7 @@ class BouncingDetectorNode(Node):
         self.get_logger().warn(f'ArUco ID {aruco_id} has no divisor in {{3, 4, 5}}')
         return None
 
-    # ------------------------------------------------------------------ #
-    #  SHAPE DETECTION                                                     #
-    # ------------------------------------------------------------------ #
-
+    # Detecção das formas
     def detect_shape(self, contour):
         """
         Returns 'TRIANGULO', 'HEXAGONO', or 'ESTRELA' — the three shapes used
@@ -126,10 +119,7 @@ class BouncingDetectorNode(Node):
 
         return "UNKNOWN"
 
-    # ------------------------------------------------------------------ #
-    #  NUMBER READING (inside a shape contour)                            #
-    # ------------------------------------------------------------------ #
-
+    # leitura dos números
     def _classify_digit_345(self, thresh):
         """
         Classifies a binarised digit image (digit=white on black) as ('3'|'4'|'5', conf).
@@ -226,10 +216,8 @@ class BouncingDetectorNode(Node):
         digit, conf = self._classify_digit_345(thresh)
         return digit, conf
 
-    # ------------------------------------------------------------------ #
-    #  MAIN CALLBACK                                                       #
-    # ------------------------------------------------------------------ #
 
+    # Main callback
     def image_callback(self, msg):
         try:
             frame = self.br.compressed_imgmsg_to_cv2(msg, desired_encoding='bgr8')

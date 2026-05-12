@@ -1,6 +1,6 @@
 from setuptools import find_packages, setup
 
-package_name = 'manometro_detector'
+package_name = 'detector'
 
 setup(
     name=package_name,
@@ -9,11 +9,8 @@ setup(
     data_files=[
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
-        ('share/' + package_name, ['package.xml'])
+        ('share/' + package_name, ['package.xml']),
     ],
-    package_data={
-        package_name: ['assets/*.png', 'assets/*.svg'],
-    },
     install_requires=['setuptools'],
     zip_safe=True,
     maintainer='marconipavan',
@@ -27,7 +24,7 @@ setup(
     },
     entry_points={
         'console_scripts': [
-            'manometro_detector = manometro_detector.manometro_detector:main'
+            'detector = detector.detector:main'
         ],
     },
 )
