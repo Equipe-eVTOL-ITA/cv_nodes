@@ -1,0 +1,78 @@
+/**:
+  ros__parameters:
+
+    # ============================================================================
+    # Image Processing Parameters
+    # ============================================================================
+    image_topic: '/vertical_camera/compressed'
+    resize_width: 600
+
+    # ============================================================================
+    # Edge Detection & Hough Parameters
+    # ============================================================================
+    canny_low: 50              # Canny edge detection low threshold
+    canny_high: 150            # Canny edge detection high threshold
+    hough_threshold: 30        # HoughLinesP votes threshold
+    min_line_length: 30        # Minimum line segment length (pixels)
+    max_line_gap: 10           # Maximum gap between line segments
+
+    # ============================================================================
+    # Red/Orange HSV Mask Parameters
+    # Detects the hose color using two HSV ranges (handles hue wrap-around)
+    # ============================================================================
+    red_lower1_h: 0            # First range lower hue (handles 0° side of wrap)
+    red_lower1_s: 100
+    red_lower1_v: 40
+    red_upper1_h: 10
+    red_upper1_s: 255
+    red_upper1_v: 255
+
+    red_lower2_h: 170          # Second range lower hue (handles 179° side of wrap)
+    red_lower2_s: 100
+    red_lower2_v: 40
+    red_upper2_h: 179
+    red_upper2_s: 255
+    red_upper2_v: 255
+
+    morph_kernel_size: 3       # Morphological kernel size (odd number)
+
+    # ============================================================================
+    # ROI (Region of Interest) Parameters
+    # Enable ROI to crop to region containing the hose, reducing noise/computation
+    # ============================================================================
+    roi_enable: false          # Set to true to enable ROI masking
+    roi_type: 'trapezoid'      # 'trapezoid' (narrower at top) or 'rectangle'
+
+    # Trapezoid ROI parameters (for roi_type: 'trapezoid')
+    # Cropping more aggressive towards horizon (top) to ignore sky/background
+    roi_top_fraction: 0.2      # Top of ROI as fraction of image height [0..1]
+    roi_bottom_fraction: 1.0   # Bottom of ROI as fraction of image height [0..1]
+    roi_left_fraction: 0.05    # Left edge as fraction of image width [0..1]
+    roi_right_fraction: 0.95   # Right edge as fraction of image width [0..1]
+
+    # ============================================================================
+    # Line Clustering & Filtering Parameters
+    # Controls how lines are grouped and filtered
+    # ============================================================================
+    angle_cluster_tolerance: 0.2     # Max angle difference (radians) to group lines
+                                      # 0.2 rad ≈ 11°, good for near-vertical hoses
+    min_cluster_length: 30.0         # Minimum total line length (pixels) to accept cluster
+
+    # ============================================================================
+    # Temporal Smoothing Parameters
+    # Reduces frame-to-frame noise by averaging across multiple frames
+    # ============================================================================
+    smoothing_window: 5              # Number of frames to average (deque size)
+                                      # 5 frames ≈ 166ms at 30fps, good trade-off
+                                      # Increase for more smoothing (higher latency)
+                                      # Decrease for faster response (more jitter)
+
+    normalize_method: 'image'        # Coordinate normalization:
+                                      # 'image' => x,y in [0, 1] (image coordinates)
+                                      # 'centered' => x,y in [-1, 1] (centered on image)
+
+    # ============================================================================
+    # Debug Parameters
+    # ============================================================================
+    debug_mask: true                 # Publish HSV mask debug image
+    debug_image: true                # Publish annotated detection image with lines/arrows

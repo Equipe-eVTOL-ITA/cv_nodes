@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 """
-Rough-line Mangueira (hose) detector using an orange mask.
+Mangueira (hose) line detector using color mask + lanes-inspired detection pipeline.
 
-Detects rough line segments with HoughLinesP on an orange color mask
-and publishes the largest line's normalized position and orientation
-so the drone can align in the plane (lateral offset) and yaw.
+Detects hose lines using:
+1. Red/orange HSV color mask
+2. ROI (Region of Interest) cropping (optional)
+3. Canny edge detection
+4. HoughLinesP line detection
+5. Slope-based line clustering and weighted averaging
+6. Temporal smoothing (deque-based)
 
-Inspired by the ball detector's orange mask pipeline.
+Publishes normalized hose position/angle for drone alignment control.
 """
 
 from collections import deque
@@ -23,6 +27,16 @@ from geometry_msgs.msg import PointStamped
 from std_msgs.msg import Float64
 from vision_msgs.msg import Detection2D, Detection2DArray, BoundingBox2D, ObjectHypothesisWithPose
 
+# Import line utilities
+from .line_utils import (
+    lines_to_slope_intercept,
+    cluster_lines_by_angle,
+    average_cluster,
+    make_line_coordinates,
+    apply_roi_mask,
+    circular_mean,
+    smooth_value_deque,
+)
 
 _DBG_QOS = QoSProfile(depth=5)
 
@@ -31,18 +45,19 @@ class MangueiraDetector(Node):
     def __init__(self):
         super().__init__('mangueira_detector')
 
-        # Parameters (some defaults borrowed from ball_detector)
+        # ============ Image processing parameters ============
         self.declare_parameter('image_topic', '/vertical_camera/compressed')
         self.declare_parameter('resize_width', 600)
-        self.declare_parameter('min_line_length', 30)
-        self.declare_parameter('max_line_gap', 10)
-        self.declare_parameter('hough_threshold', 30)
+
+        # ============ Edge detection & Hough parameters ============
         self.declare_parameter('canny_low', 50)
         self.declare_parameter('canny_high', 150)
+        self.declare_parameter('hough_threshold', 30)
+        self.declare_parameter('min_line_length', 30)
+        self.declare_parameter('max_line_gap', 10)
 
-        # Red mask params (handle hue wrap-around with two ranges)
-        # Target colors between #620000 (darker) and #D40000 (brighter)
-        # Range split to handle H wrap-around around 0/179
+        # ============ Red/orange mask parameters ============
+        # Handle hue wrap-around with two ranges
         self.declare_parameter('red_lower1_h', 0)
         self.declare_parameter('red_lower1_s', 100)
         self.declare_parameter('red_lower1_v', 40)
@@ -59,12 +74,28 @@ class MangueiraDetector(Node):
 
         self.declare_parameter('morph_kernel_size', 3)
 
+        # ============ ROI parameters ============
+        self.declare_parameter('roi_enable', False)
+        self.declare_parameter('roi_type', 'trapezoid')  # 'trapezoid' or 'rectangle'
+        self.declare_parameter('roi_top_fraction', 0.2)
+        self.declare_parameter('roi_bottom_fraction', 1.0)
+        self.declare_parameter('roi_left_fraction', 0.05)
+        self.declare_parameter('roi_right_fraction', 0.95)
+
+        # ============ Line clustering & filtering parameters ============
+        self.declare_parameter('angle_cluster_tolerance', 0.2)  # radians (~11 deg)
+        self.declare_parameter('min_cluster_length', 30.0)  # minimum total length to accept cluster
+
+        # ============ Temporal smoothing parameters ============
+        self.declare_parameter('smoothing_window', 5)  # deque max length for temporal averaging
+        self.declare_parameter('normalize_method', 'image')  # 'image' (0..1) or 'centered' (-1..1)
+
+        # ============ Debug parameters ============
         self.declare_parameter('debug_mask', True)
         self.declare_parameter('debug_image', True)
 
-        # Publishers / subscribers
+        # ============ ROS infrastructure ============
         image_topic = self.get_parameter('image_topic').value
-
         self.bridge = CvBridge()
 
         self.pos_pub = self.create_publisher(PointStamped, '/mangueira/position', 10)
@@ -75,7 +106,18 @@ class MangueiraDetector(Node):
 
         self.sub = self.create_subscription(CompressedImage, image_topic, self.image_callback, 10)
 
-        self.get_logger().info(f'Mangueira rough-line detector started. Subscribed to {image_topic}')
+        # ============ State for temporal smoothing ============
+        smoothing_window = int(self.get_parameter('smoothing_window').value)
+        self._pos_x_history = deque(maxlen=smoothing_window)
+        self._pos_y_history = deque(maxlen=smoothing_window)
+        self._angle_history = deque(maxlen=smoothing_window)
+
+        self.get_logger().info(
+            f'Mangueira detector (lanes-inspired) started.\n'
+            f'  Image topic: {image_topic}\n'
+            f'  ROI enabled: {self.get_parameter("roi_enable").value}\n'
+            f'  Smoothing window: {smoothing_window}'
+        )
 
     def _build_red_mask(self, frame_bgr):
         # Build red mask using two HSV ranges to handle hue wrap-around
@@ -117,18 +159,32 @@ class MangueiraDetector(Node):
         return mask
 
     def image_callback(self, msg):
+        """Main processing pipeline: mask -> ROI -> Canny -> Hough -> cluster -> smooth -> publish"""
         try:
             frame = self.bridge.compressed_imgmsg_to_cv2(msg, desired_encoding='bgr8')
         except Exception as exc:
             self.get_logger().error(f'Failed to convert image: {exc}')
             return
 
+        # Resize frame
         resize_width = int(self.get_parameter('resize_width').value)
         scale = resize_width / float(frame.shape[1])
         frame = cv2.resize(frame, (resize_width, int(frame.shape[0] * scale)))
         height, width = frame.shape[:2]
 
+        # ============ Step 1: Build red/orange color mask ============
         mask = self._build_red_mask(frame)
+
+        # ============ Step 2: Apply ROI if enabled ============
+        if bool(self.get_parameter('roi_enable').value):
+            roi_type = self.get_parameter('roi_type').value
+            roi_params = {
+                'top_fraction': float(self.get_parameter('roi_top_fraction').value),
+                'bottom_fraction': float(self.get_parameter('roi_bottom_fraction').value),
+                'left_fraction': float(self.get_parameter('roi_left_fraction').value),
+                'right_fraction': float(self.get_parameter('roi_right_fraction').value),
+            }
+            mask = apply_roi_mask(mask, roi_type=roi_type, roi_params=roi_params)
 
         # Debug: publish mask as Image
         if bool(self.get_parameter('debug_mask').value):
@@ -142,11 +198,12 @@ class MangueiraDetector(Node):
             except CvBridgeError as e:
                 self.get_logger().error(f'Failed to publish mask image: {e}')
 
-        # Edge detection and Hough lines
+        # ============ Step 3: Canny edge detection ============
         canny_low = int(self.get_parameter('canny_low').value)
         canny_high = int(self.get_parameter('canny_high').value)
         edges = cv2.Canny(mask, canny_low, canny_high)
 
+        # ============ Step 4: HoughLinesP line detection ============
         rho = 1
         theta = np.pi / 180.0
         threshold = int(self.get_parameter('hough_threshold').value)
@@ -155,101 +212,155 @@ class MangueiraDetector(Node):
 
         lines = cv2.HoughLinesP(edges, rho, theta, threshold, minLineLength=min_line_length, maxLineGap=max_line_gap)
 
+        # ============ Step 5: Convert to slope/intercept and cluster ============
+        line_data = lines_to_slope_intercept(lines)
+
+        angle_tol = float(self.get_parameter('angle_cluster_tolerance').value)
+        clusters = cluster_lines_by_angle(line_data, angle_tolerance=angle_tol)
+
+        # Filter clusters by minimum total length
+        min_cluster_len = float(self.get_parameter('min_cluster_length').value)
+        clusters = [c for c in clusters if sum(l[2] for l in c) >= min_cluster_len]
+
         annotated = frame.copy()
         detection_array = Detection2DArray()
         detection_array.header = msg.header
 
-        best_line = None
-        best_len = 0.0
+        best_detection = None
+        best_confidence = 0.0
 
-        # Draw all lines faintly
-        if lines is not None:
-            for l in lines:
-                x1, y1, x2, y2 = l[0]
-                length = math.hypot(x2 - x1, y2 - y1)
-                cv2.line(annotated, (x1, y1), (x2, y2), (255, 0, 0), 1)
-                if length > best_len:
-                    best_len = length
-                    best_line = (x1, y1, x2, y2)
+        # ============ Step 6: Process best cluster and publish ============
+        if clusters:
+            # Find best cluster (by total length)
+            best_cluster = max(clusters, key=lambda c: sum(l[2] for l in c))
 
-        # If a best line found, publish position and angle
-        if best_line is not None:
-            x1, y1, x2, y2 = best_line
-            cx = int((x1 + x2) / 2)
-            cy = int((y1 + y2) / 2)
+            avg_result = average_cluster(best_cluster)
+            if avg_result is not None:
+                avg_slope, avg_intercept, total_length, center_x, center_y = avg_result
 
-            # Normalized center [0,1]
-            norm_x = float(cx) / float(width)
-            norm_y = float(cy) / float(height)
+                # Reconstruct line coordinates
+                y_bottom = height - 1
+                y_top = int(height * 0.3)  # Extend line upwards for visualization
+                line_coords = make_line_coordinates(avg_slope, avg_intercept, y_bottom, y_top)
+                x1, y1, x2, y2 = line_coords
 
-            # Angle relative to vertical: use atan2(dx, dy) so 0 = vertical
-            dx = float(x2 - x1)
-            dy = float(y2 - y1)
-            angle = math.atan2(dx, dy) if (dx != 0.0 or dy != 0.0) else 0.0
-            # Normalize to [-pi/2, pi/2]
-            while angle > math.pi/2:
-                angle -= math.pi
-            while angle < -math.pi/2:
-                angle += math.pi
+                # Clamp to image bounds
+                x1 = max(0, min(width - 1, x1))
+                x2 = max(0, min(width - 1, x2))
+                y1 = max(0, min(height - 1, y1))
+                y2 = max(0, min(height - 1, y2))
 
-            # Confidence proportional to line length normalized by image diagonal
-            diag = math.hypot(width, height)
-            confidence = float(best_len / diag)
+                # Compute angle (atan2(dx, dy) so 0 = vertical)
+                dx = float(x2 - x1)
+                dy = float(y2 - y1)
+                if dy != 0.0 or dx != 0.0:
+                    angle_raw = math.atan2(dx, dy)
+                    # Normalize to [-pi/2, pi/2]
+                    while angle_raw > math.pi / 2:
+                        angle_raw -= math.pi
+                    while angle_raw < -math.pi / 2:
+                        angle_raw += math.pi
+                else:
+                    angle_raw = 0.0
 
-            # Publish PointStamped (x,y normalized, z=confidence)
-            pos_msg = PointStamped()
-            pos_msg.header = msg.header
-            pos_msg.point.x = norm_x
-            pos_msg.point.y = norm_y
-            pos_msg.point.z = confidence
-            self.pos_pub.publish(pos_msg)
+                # Compute confidence
+                diag = math.hypot(width, height)
+                confidence = float(total_length / diag)
 
-            angle_msg = Float64()
-            angle_msg.data = float(angle)
-            self.angle_pub.publish(angle_msg)
+                # ============ Step 7: Temporal smoothing ============
+                norm_x = float(center_x) / float(width) if self.get_parameter('normalize_method').value == 'image' else 2 * float(center_x) / float(width) - 1.0
+                norm_y = float(center_y) / float(height) if self.get_parameter('normalize_method').value == 'image' else 2 * float(center_y) / float(height) - 1.0
 
-            # Build a simple Detection2D for consumers expecting array
-            det = Detection2D()
-            det.header = msg.header
-            # bounding box centered on line midpoint with small size
-            bbox = BoundingBox2D()
-            bbox.center.position.x = norm_x
-            bbox.center.position.y = norm_y
-            bbox.size_x = min(0.5, best_len / float(width))
-            bbox.size_y = min(0.2, best_len / float(height))
-            det.bbox = bbox
-            hyp = ObjectHypothesisWithPose()
-            hyp.hypothesis.class_id = 'mangueira'
-            hyp.hypothesis.score = float(min(0.99, confidence))
-            det.results.append(hyp)
-            detection_array.detections.append(det)
+                smoothed_x = smooth_value_deque(norm_x, self._pos_x_history, use_circular=False)
+                smoothed_y = smooth_value_deque(norm_y, self._pos_y_history, use_circular=False)
+                smoothed_angle = smooth_value_deque(angle_raw, self._angle_history, use_circular=True)
 
-            # Annotate best line prominently
-            cv2.line(annotated, (x1, y1), (x2, y2), (0, 255, 0), 3)
-            # Arrow to indicate direction (pt2 is arrow tip)
-            arrow_tip = (int(x2), int(y2))
-            # Compute small arrow
-            arrow_len = int(min(30, best_len * 0.2))
-            ang = angle
-            left = (int(arrow_tip[0] + arrow_len * math.sin(ang + 0.5)),
-                    int(arrow_tip[1] + arrow_len * math.cos(ang + 0.5)))
-            right = (int(arrow_tip[0] + arrow_len * math.sin(ang - 0.5)),
-                     int(arrow_tip[1] + arrow_len * math.cos(ang - 0.5)))
-            cv2.line(annotated, arrow_tip, left, (0, 255, 0), 2)
-            cv2.line(annotated, arrow_tip, right, (0, 255, 0), 2)
+                best_detection = {
+                    'center_x': center_x,
+                    'center_y': center_y,
+                    'angle': smoothed_angle,
+                    'norm_x': smoothed_x,
+                    'norm_y': smoothed_y,
+                    'confidence': confidence,
+                    'x1': x1,
+                    'y1': y1,
+                    'x2': x2,
+                    'y2': y2,
+                    'total_length': total_length,
+                }
+                best_confidence = confidence
 
-            cv2.circle(annotated, (cx, cy), 5, (0, 0, 255), -1)
-            cv2.putText(annotated, f'angle={math.degrees(angle):.1f}deg conf={confidence:.2f}',
-                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                # ============ Step 8: Publish messages ============
+                pos_msg = PointStamped()
+                pos_msg.header = msg.header
+                pos_msg.point.x = smoothed_x
+                pos_msg.point.y = smoothed_y
+                pos_msg.point.z = confidence
+                self.pos_pub.publish(pos_msg)
 
-        else:
-            cv2.putText(annotated, 'no line detected', (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                angle_msg = Float64()
+                angle_msg.data = float(smoothed_angle)
+                self.angle_pub.publish(angle_msg)
 
-        # Publish detection array
+                # Build Detection2D message
+                det = Detection2D()
+                det.header = msg.header
+                bbox = BoundingBox2D()
+                bbox.center.position.x = smoothed_x
+                bbox.center.position.y = smoothed_y
+                bbox.size_x = min(0.5, total_length / float(width))
+                bbox.size_y = min(0.2, total_length / float(height))
+                det.bbox = bbox
+                hyp = ObjectHypothesisWithPose()
+                hyp.hypothesis.class_id = 'mangueira'
+                hyp.hypothesis.score = float(min(0.99, confidence))
+                det.results.append(hyp)
+                detection_array.detections.append(det)
+
+        # Publish detection array (even if empty)
         self.detections_pub.publish(detection_array)
 
-        # Publish annotated image if requested
+        # ============ Step 9: Annotate and debug publish ============
         if bool(self.get_parameter('debug_image').value):
+            # Draw all detected lines faintly
+            if line_data:
+                for slope, intercept, length, x1, y1, x2, y2 in line_data:
+                    cv2.line(annotated, (int(x1), int(y1)), (int(x2), int(y2)), (100, 100, 255), 1)
+
+            # Draw best cluster lines in yellow
+            if clusters and best_detection:
+                best_cluster = max(clusters, key=lambda c: sum(l[2] for l in c))
+                for slope, intercept, length, x1, y1, x2, y2 in best_cluster:
+                    cv2.line(annotated, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 255), 2)
+
+                # Draw final averaged line in green
+                x1, y1, x2, y2 = best_detection['x1'], best_detection['y1'], best_detection['x2'], best_detection['y2']
+                cv2.line(annotated, (x1, y1), (x2, y2), (0, 255, 0), 3)
+
+                # Draw arrow pointing along line
+                cx, cy = int(best_detection['center_x']), int(best_detection['center_y'])
+                arrow_len = int(min(40, best_detection['total_length'] * 0.25))
+                angle = best_detection['angle']
+                left = (int(x2 + arrow_len * math.sin(angle + 0.5)),
+                        int(y2 + arrow_len * math.cos(angle + 0.5)))
+                right = (int(x2 + arrow_len * math.sin(angle - 0.5)),
+                         int(y2 + arrow_len * math.cos(angle - 0.5)))
+                cv2.line(annotated, (x2, y2), left, (0, 255, 0), 2)
+                cv2.line(annotated, (x2, y2), right, (0, 255, 0), 2)
+
+                # Draw center circle
+                cv2.circle(annotated, (cx, cy), 5, (0, 0, 255), -1)
+
+                # Draw info text
+                angle_deg = math.degrees(best_detection['angle'])
+                conf = best_detection['confidence']
+                cv2.putText(annotated, f'angle={angle_deg:.1f}deg conf={conf:.2f}',
+                            (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                cv2.putText(annotated, f'pos=({best_detection["norm_x"]:.2f}, {best_detection["norm_y"]:.2f})',
+                            (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+            else:
+                cv2.putText(annotated, 'no line detected', (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+
             try:
                 ann_msg = self.bridge.cv2_to_imgmsg(annotated, encoding='bgr8')
                 ann_msg.header = msg.header
