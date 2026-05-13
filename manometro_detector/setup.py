@@ -27,7 +27,10 @@ setup(
     },
     entry_points={
         'console_scripts': [
-            'manometro_detector = manometro_detector.manometro_detector:main'
+            #'manometro_detector = manometro_detector.manometro_detector:main',
+            # alternate entrypoint so you can run the "_att" variant directly
+            #'manometro_detector_att = manometro_detector.manometro_detector_att:main'
+            'manometro_detector = manometro_detector.manometro_detector_att:main',
         ],
     },
 )
