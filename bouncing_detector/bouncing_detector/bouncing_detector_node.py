@@ -46,15 +46,23 @@ class BouncingDetectorNode(Node):
         self.declare_parameter('vertical_camera_topic', '/vertical_camera/compressed')
         camera_topic = self.get_parameter('vertical_camera_topic').get_parameter_value().string_value
 
+        self._debug_pub_interval = self.get_parameter('debug_pub_interval').get_parameter_value().double_value
+
         qos = QoSProfile(
             history=QoSHistoryPolicy.KEEP_LAST,
-            depth=5,
+            depth=1,
             reliability=QoSReliabilityPolicy.BEST_EFFORT,
             durability=QoSDurabilityPolicy.VOLATILE
         )
 
         self.publisher_  = self.create_publisher(BouncingDetection, 'bouncing_detection', 10)
+
         self.debug_pub_  = self.create_publisher(CompressedImage, 'bouncing_detection_image/compressed', qos)
+        self._debug_last_pub_time = self.get_clock().now()
+        self._debug_pub_interval = rclpy.duration.Duration(seconds=self._debug_pub_interval)
+        self._debug_max_width = 640
+        self._jpeg_quality = 60 # porcentagem de qualidade
+
 
         self.subscription = self.create_subscription(
             CompressedImage,
@@ -374,6 +382,26 @@ class BouncingDetectorNode(Node):
             debug_msg = self.br.cv2_to_compressed_imgmsg(output_frame)
             debug_msg.header = msg.header
             self.debug_pub_.publish(debug_msg)
+            now_s = self.get_clock().now().nanoseconds * 1e-9
+            if (now_s - self._debug_last_pub_time) >= self._debug_pub_interval:
+                h, w = output_frame.shape[:2]
+                if w > self._debug_max_width:
+                   scale = float(self._debug_max_width) / float(w)
+                   output_small = cv2.resize(output_frame, (int(w*scale), int(h*scale)),interpolation=cv2.INTER_AREA)
+                else:
+                   output_small = output_frame
+                ret, enc = cv2.imencode('.jpg', output_small,
+                                        [int(cv2.IMWRITE_JPEG_QUALITY), int(self._jpeg_quality)])
+                if not ret:
+                    self.get_logger().error('JPEG encoding failed for debug image')
+                else:
+                    debug_msg = CompressedImage()
+                    debug_msg.format = 'jpeg'
+                    debug_msg.data = np.array(enc).tobytes()
+                    debug_msg.header = msg.header
+                    self.debug_pub_.publish(debug_msg)
+                    self._debug_last_pub_time = now_s
+
         except Exception as e:
             self.get_logger().error(f'Failed to publish debug image: {e}')
 
