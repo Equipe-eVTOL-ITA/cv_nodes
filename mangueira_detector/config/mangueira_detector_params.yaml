@@ -12,23 +12,23 @@
     # ============================================================================
     canny_low: 50              # Canny edge detection low threshold
     canny_high: 150            # Canny edge detection high threshold
-    hough_threshold: 30        # HoughLinesP votes threshold
-    min_line_length: 30        # Minimum line segment length (pixels)
-    max_line_gap: 10           # Maximum gap between line segments
+    hough_threshold: 15        # HoughLinesP votes threshold (lowered: hose appears thin at 2m+)
+    min_line_length: 12        # Minimum line segment length — at 2m: 12px ≈ 8cm of hose
+    max_line_gap: 25           # Maximum gap — wider connects fragmented hose at altitude
 
     # ============================================================================
     # Red/Orange HSV Mask Parameters
     # Detects the hose color using two HSV ranges (handles hue wrap-around)
     # ============================================================================
     red_lower1_h: 0            # First range lower hue (handles 0° side of wrap)
-    red_lower1_s: 100
+    red_lower1_s: 70           # Lowered: saturation decreases at altitude (was 100)
     red_lower1_v: 40
     red_upper1_h: 10
     red_upper1_s: 255
     red_upper1_v: 255
 
     red_lower2_h: 170          # Second range lower hue (handles 179° side of wrap)
-    red_lower2_s: 100
+    red_lower2_s: 70           # Lowered: saturation decreases at altitude (was 100)
     red_lower2_v: 40
     red_upper2_h: 179
     red_upper2_s: 255
@@ -56,14 +56,14 @@
     # ============================================================================
     angle_cluster_tolerance: 0.2     # Max angle difference (radians) to group lines
                                       # 0.2 rad ≈ 11°, good for near-vertical hoses
-    min_cluster_length: 30.0         # Minimum total line length (pixels) to accept cluster
+    min_cluster_length: 12.0         # Minimum total cluster length (lowered for altitude detection)
 
     # ============================================================================
     # Temporal Smoothing Parameters
     # Reduces frame-to-frame noise by averaging across multiple frames
     # ============================================================================
-    smoothing_window: 5              # Number of frames to average (deque size)
-                                      # 5 frames ≈ 166ms at 30fps, good trade-off
+    smoothing_window: 2              # Number of frames to average (deque size)
+                                      # 2 frames ≈ 0.5s at 4fps — reduced from 5 to cut lag
                                       # Increase for more smoothing (higher latency)
                                       # Decrease for faster response (more jitter)
 

@@ -33,7 +33,7 @@ class BallDetectorNode(Node):
         self.declare_parameter('max_area', 30000.0)
         self.declare_parameter('min_circularity', 0.55)
         self.declare_parameter('orange_h_min', 5)
-        self.declare_parameter('orange_h_max', 25)
+        self.declare_parameter('orange_h_max', 30)  # widened: log shows dom H≈25-30
         self.declare_parameter('orange_s_min', 80)
         self.declare_parameter('orange_v_min', 50)
         self.declare_parameter('morph_kernel_size', 5)
