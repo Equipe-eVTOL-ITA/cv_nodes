@@ -2,10 +2,10 @@ import cv2
 import numpy as np
 import easyocr
 
-def detectar_com_easyocr(caminho_imagem):
-    print("Carregando modelo EasyOCR...")
-    reader = easyocr.Reader(['en'], gpu=True)
+print("Carregando modelo EasyOCR...")
+reader = easyocr.Reader(['en'], gpu=True)
 
+def detectar_com_easyocr(caminho_imagem):
     img = cv2.imread(caminho_imagem)
     if img is None:
         print("Erro: Não foi possível carregar a imagem.")
@@ -53,10 +53,7 @@ def detectar_com_easyocr(caminho_imagem):
                 
                 print(f"Sucesso -> Detectado: {texto} | Confiança: {confianca:.2f}")
 
-    # ==========================================
-    # A MUDANÇA ESTÁ AQUI
-    # Salva a imagem no disco em vez de tentar abrir uma janela
-    # ==========================================
+
     nome_arquivo_saida = "resultado_easyocr.png"
     sucesso_salvamento = cv2.imwrite(nome_arquivo_saida, img_resultado)
     
