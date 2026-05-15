@@ -38,6 +38,11 @@ class BallDetectorNode(Node):
         self.declare_parameter('orange_v_min', 50)
         self.declare_parameter('morph_kernel_size', 5)
 
+        # ROI vertical: ignora os r pixels do topo e da base da imagem
+        # (reduz false positives no chão e no céu)
+        # roi_margin=0 desativa o filtro
+        self.declare_parameter('roi_margin', 0)
+
         self.declare_parameter('debug_mask', True)
         self.declare_parameter('debug_image', True)
 
@@ -102,6 +107,12 @@ class BallDetectorNode(Node):
         height, width = frame.shape[:2]
 
         mask = self._build_orange_mask(frame)
+
+        # Aplica ROI vertical: zera os r pixels do topo e da base
+        r = int(self.get_parameter('roi_margin').value)
+        if r > 0:
+            mask[:r, :]         = 0  # banda superior
+            mask[height - r:, :] = 0  # banda inferior
 
         if bool(self.get_parameter('debug_mask').value):
             mask_dbg = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
@@ -194,6 +205,10 @@ class BallDetectorNode(Node):
         self.publisher_.publish(det_msg)
 
         if bool(self.get_parameter('debug_image').value):
+            # Desenha bordas da ROI no debug
+            if r > 0:
+                cv2.line(output, (0, r),          (width, r),          (255, 255, 0), 1)
+                cv2.line(output, (0, height - r), (width, height - r), (255, 255, 0), 1)
             self._pub_debug(self.debug_pub_, output, msg.header)
 
 
