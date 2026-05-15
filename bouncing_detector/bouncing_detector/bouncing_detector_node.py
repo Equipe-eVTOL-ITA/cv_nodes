@@ -46,6 +46,7 @@ class BouncingDetectorNode(Node):
         self.declare_parameter('vertical_camera_topic', '/vertical_camera/compressed')
         camera_topic = self.get_parameter('vertical_camera_topic').get_parameter_value().string_value
 
+        self.declare_parameter('debug_pub_interval', 0.2)
         self._debug_pub_interval = self.get_parameter('debug_pub_interval').get_parameter_value().double_value
 
         qos = QoSProfile(
