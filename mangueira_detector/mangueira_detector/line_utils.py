@@ -169,11 +169,12 @@ def average_cluster(cluster):
     total_length = sum(l[2] for l in cluster)
     if total_length < 1.0:
         return None
-    
-    # Weighted average of slope and intercept
-    avg_slope = sum(l[0] * l[2] for l in cluster) / total_length if not any(math.isinf(l[0]) for l in cluster) else float('inf')
-    avg_intercept = sum(l[1] * l[2] for l in cluster) / total_length if not any(math.isinf(l[0]) for l in cluster) else 0.0
-    
+
+    vertical = [l for l in cluster if math.isinf(l[0])]
+    non_vertical = [l for l in cluster if not math.isinf(l[0])]
+    len_v = sum(l[2] for l in vertical)
+    len_nv = sum(l[2] for l in non_vertical)
+
     # Geometric center of all line endpoints
     all_x = []
     all_y = []
@@ -184,8 +185,82 @@ def average_cluster(cluster):
     
     center_x = np.mean(all_x)
     center_y = np.mean(all_y)
-    
+
+    # Slope/intercept for y = m x + b. For vertical Hough segments, intercept stores x (see lines_to_slope_intercept).
+    if not vertical:
+        avg_slope = sum(l[0] * l[2] for l in non_vertical) / len_nv
+        avg_intercept = sum(l[1] * l[2] for l in non_vertical) / len_nv
+    elif not non_vertical:
+        avg_slope = float('inf')
+        avg_intercept = sum(l[1] * l[2] for l in vertical) / len_v
+    else:
+        # Mixed vertical + finite-slope: pick representation by dominated edge length
+        if len_nv >= len_v:
+            avg_slope = sum(l[0] * l[2] for l in non_vertical) / len_nv
+            avg_intercept = sum(l[1] * l[2] for l in non_vertical) / len_nv
+        else:
+            avg_slope = float('inf')
+            avg_intercept = sum(l[1] * l[2] for l in vertical) / len_v
+
     return (avg_slope, avg_intercept, total_length, center_x, center_y)
+
+
+def line_extremes_through_center(cluster, center_x, center_y, width, height, y_top_frac=0.3):
+    """
+    Segment along length-weighted mean direction of cluster segments, passing through
+    (center_x, center_y), clipped to image. Robust for mixed vertical / near-vertical clusters.
+    """
+    y_top = int(height * y_top_frac)
+    y_bottom = height - 1
+
+    ux = uy = 0.0
+    wsum = 0.0
+    for line in cluster:
+        _, _, length, x1, y1, x2, y2 = line
+        ddx = float(x2 - x1)
+        ddy = float(y2 - y1)
+        nrm = math.hypot(ddx, ddy)
+        if nrm < 1e-6:
+            continue
+        ux += (ddx / nrm) * length
+        uy += (ddy / nrm) * length
+        wsum += length
+    if wsum < 1e-6:
+        return None
+    ux /= wsum
+    uy /= wsum
+    nrm = math.hypot(ux, uy)
+    if nrm < 1e-6:
+        return None
+    ux /= nrm
+    uy /= nrm
+
+    def clamp_xy(x, y):
+        xi = int(round(x))
+        yi = int(round(y))
+        xi = max(0, min(width - 1, xi))
+        yi = max(0, min(height - 1, yi))
+        return xi, yi
+
+    if abs(uy) > 1e-6:
+        t1 = (y_top - center_y) / uy
+        t2 = (y_bottom - center_y) / uy
+        x1 = center_x + t1 * ux
+        x2 = center_x + t2 * ux
+        p1 = clamp_xy(x1, y_top)
+        p2 = clamp_xy(x2, y_bottom)
+        return (p1[0], p1[1], p2[0], p2[1])
+
+    # Nearly horizontal direction: span by x
+    if abs(ux) < 1e-6:
+        return (*clamp_xy(center_x, y_top), *clamp_xy(center_x, y_bottom))
+    t0 = (0.0 - center_x) / ux
+    t1 = (float(width - 1) - center_x) / ux
+    y0 = center_y + t0 * uy
+    y1 = center_y + t1 * uy
+    p0 = clamp_xy(0.0, y0)
+    p1 = clamp_xy(float(width - 1), y1)
+    return (p0[0], p0[1], p1[0], p1[1])
 
 
 def make_line_coordinates(slope, intercept, y1, y2):

@@ -33,6 +33,7 @@ from .line_utils import (
     cluster_lines_by_angle,
     average_cluster,
     make_line_coordinates,
+    line_extremes_through_center,
     apply_roi_mask,
     circular_mean,
     smooth_value_deque,
@@ -238,11 +239,23 @@ class MangueiraDetector(Node):
             if avg_result is not None:
                 avg_slope, avg_intercept, total_length, center_x, center_y = avg_result
 
-                # Reconstruct line coordinates
+                # Reconstruct line coordinates for debug overlay
                 y_bottom = height - 1
                 y_top = int(height * 0.3)  # Extend line upwards for visualization
-                line_coords = make_line_coordinates(avg_slope, avg_intercept, y_bottom, y_top)
-                x1, y1, x2, y2 = line_coords
+                vertical_count = sum(1 for ln in best_cluster if math.isinf(ln[0]))
+                non_vertical_count = len(best_cluster) - vertical_count
+                if vertical_count > 0 and non_vertical_count > 0:
+                    geo = line_extremes_through_center(
+                        best_cluster, center_x, center_y, width, height, y_top_frac=0.3
+                    )
+                    if geo is not None:
+                        x1, y1, x2, y2 = geo
+                    else:
+                        line_coords = make_line_coordinates(avg_slope, avg_intercept, y_bottom, y_top)
+                        x1, y1, x2, y2 = line_coords
+                else:
+                    line_coords = make_line_coordinates(avg_slope, avg_intercept, y_bottom, y_top)
+                    x1, y1, x2, y2 = line_coords
 
                 # Clamp to image bounds
                 x1 = max(0, min(width - 1, x1))
@@ -322,6 +335,9 @@ class MangueiraDetector(Node):
 
         # ============ Step 9: Annotate and debug publish ============
         if bool(self.get_parameter('debug_image').value):
+            # Vertical reference line at the image center.
+            cv2.line(annotated, (width // 2, 0), (width // 2, height - 1), (0, 0, 255), 2)
+
             # Draw all detected lines faintly
             if line_data:
                 for slope, intercept, length, x1, y1, x2, y2 in line_data:
