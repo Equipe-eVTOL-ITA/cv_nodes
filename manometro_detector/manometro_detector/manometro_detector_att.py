@@ -1,5 +1,6 @@
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
 from sensor_msgs.msg import CompressedImage
 from std_msgs.msg import Float32, Int16MultiArray, String
 from geometry_msgs.msg import Point
@@ -355,11 +356,16 @@ class ManometroDetector(Node):
 
         self.bridge = CvBridge()
 
+        camera_qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE,
+            depth=10,
+        )
         self.img_sub = self.create_subscription(
             CompressedImage,
             '/vertical_camera/compressed',
             self.callback,
-            10 # QoS
+            camera_qos,
         )
 
         self.pressure_pub = self.create_publisher(
@@ -426,16 +432,14 @@ class ManometroDetector(Node):
 
         self._miss_log_time  = 0.0
         self._skip_log_time  = 0.0
-        self._latest_debug_frame = None  # most recent annotated frame for saving
+        self._latest_debug_frame = None
 
-        # Subscribe to pressure analysis to trigger image saving
         self._save_dir = os.path.expanduser('~/evtol/manometro_readings')
         os.makedirs(self._save_dir, exist_ok=True)
         self.create_subscription(
             String, '/pressure_analysis', self._save_callback, 10)
 
     def _save_callback(self, msg):
-        """Save the annotated debug frame when a pressure measurement is published."""
         if not msg.data or self._latest_debug_frame is None:
             return
         is_above = 'above' in msg.data
@@ -668,7 +672,6 @@ class ManometroDetector(Node):
                 err_msg.y = float('nan')
             self.error_pub.publish(err_msg)
 
-            # Store latest frame for saving when pressure_analysis fires
             self._latest_debug_frame = debug_frame.copy()
 
             # Publish debug image

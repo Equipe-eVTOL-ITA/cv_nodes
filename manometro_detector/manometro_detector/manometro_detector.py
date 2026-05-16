@@ -1,7 +1,7 @@
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import CompressedImage
-from std_msgs.msg import Float32, Int16MultiArray, String
+from std_msgs.msg import Float32, Int16MultiArray
 from geometry_msgs.msg import Point
 from cv_bridge import CvBridge
 
@@ -9,7 +9,6 @@ import cv2 as cv
 import numpy as np
 import os
 import time
-from datetime import datetime
 
 # Configurações
 TEMPLATE_SIZE = 400          # Side length (px) for the canonical square
@@ -417,23 +416,6 @@ class ManometroDetector(Node):
         self._skip_log_time  = 0.0
         self._latest_debug_frame = None  # most recent annotated frame for saving
 
-        # Subscribe to pressure analysis to trigger image saving
-        self._save_dir = os.path.expanduser('~/evtol/manometro_readings')
-        os.makedirs(self._save_dir, exist_ok=True)
-        self.create_subscription(
-            String, '/pressure_analysis', self._save_callback, 10)
-
-    def _save_callback(self, msg):
-        """Save the annotated debug frame when a pressure measurement is published."""
-        if not msg.data or self._latest_debug_frame is None:
-            return
-        is_above = 'above' in msg.data
-        label    = 'ACIMA_DO_LIMITE' if is_above else 'DENTRO_DO_LIMITE'
-        ts       = datetime.now().strftime('%Y%m%d_%H%M%S')
-        filename = f'manometro_{ts}_{label}.jpg'
-        path     = os.path.join(self._save_dir, filename)
-        cv.imwrite(path, self._latest_debug_frame)
-        self.get_logger().info(f'[foto] Salva em {path}')
 
     def callback(self, msg):
         try:
