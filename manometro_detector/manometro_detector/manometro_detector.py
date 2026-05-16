@@ -1,7 +1,7 @@
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import CompressedImage
-from std_msgs.msg import Float32, Int16MultiArray
+from std_msgs.msg import Float32, Int16MultiArray, String
 from geometry_msgs.msg import Point
 from cv_bridge import CvBridge
 
@@ -9,16 +9,20 @@ import cv2 as cv
 import numpy as np
 import os
 import time
+import math
+from datetime import datetime
 
 # Configurações
 TEMPLATE_SIZE = 400          # Side length (px) for the canonical square
 DIFF_BLUR_KSIZE = 7          # (Median) Blur kernel for diff cleanup
 DIFF_THRESHOLD = 30          # Threshold applied after blur on the diff image
 EPSILON_RAMER_DOUGLAS_PEUCKER = 0.04 # Valor do epsilon para o algoritmo de RDP
-ROI_RADIUS_RATIO = 0.40      # Define a ROI interna (cobre o ponteiro sem incluir números da borda)
+ROI_RADIUS_RATIO = 0.27      # Define a ROI interna (cobre o ponteiro sem incluir números da borda)
+ROI_INV_RADIUS_RATIO = 0.17  # fator subtraído da ROI, tornando-a uma coroa circular
 ROI_OFFSET_Y = -20           # Deslocamento vertical do centro da ROI (cabinho da moldura)
 ROI_OFFSET_X = 0             # Deslocamento horizontal do centro da ROI
 MAX_POINTER_PIXELS = 50000    # Limite máximo de pixels brancos (ruído). Acima disso = Miss Detection
+PIVOT_Y_RATIO = 0.43788      # Razão do deslocamento do centro da ROI
 
 # Angle (degrees, math convention: 0=right, CCW positive) observed when the
 # pointer is at the 0-pressure and 100-pressure marks.
@@ -38,8 +42,41 @@ def order_corners(pts):
     rect[3] = pts[np.argmax(d)]   # bottom-left has largest x-y
     return rect, (rect[0]+rect[1]+rect[2]+rect[3])
 
+def angulo_valido(approx, limite_min_graus=20, limite_max_graus=150):
+    n = len(approx)
+    if n < 3: return False
+    
+    for i in range(n):
+        # Pega 3 pontos seguidos (fazendo o wrap com o resto da divisão para o último ponto)
+        p1 = approx[i][0]
+        p2 = approx[(i + 1) % n][0] # Vértice do ângulo
+        p3 = approx[(i + 2) % n][0]
+        
+        # Cria os vetores u e v
+        u = np.array([p1[0] - p2[0], p1[1] - p2[1]])
+        v = np.array([p3[0] - p2[0], p3[1] - p2[1]])
+        
+        # Produto escalar e normas
+        dot_product = np.dot(u, v)
+        norm_u = np.linalg.norm(u)
+        norm_v = np.linalg.norm(v)
+        
+        # Evita divisão por zero
+        if norm_u == 0 or norm_v == 0: continue
+        
+        # Calcula o ângulo em graus
+        cos_theta = dot_product / (norm_u * norm_v)
+        # Clip para evitar erros de precisão numérica fora de [-1, 1]
+        cos_theta = np.clip(cos_theta, -1.0, 1.0)
+        angulo = math.degrees(math.acos(cos_theta))
+        
+        if angulo < limite_min_graus or angulo > limite_max_graus:
+            return False # Se achar um ângulo "fechado" demais, descarta o contorno
+            
+    return True
 
-def find_square(binary):
+
+def find_square(binary, frame):
     """
     Find the largest approximate quadrilateral in a binary image.
     Returns the 4 ordered corners or None.
@@ -49,14 +86,32 @@ def find_square(binary):
     best_area = 0
     for cnt in contours:
         area = cv.contourArea(cnt)
-        if area < 1000:
+        l1, l2 = frame.shape[:2]
+        if area < 100 or area > (l1*l2)*0.2:
             continue
         peri = cv.arcLength(cnt, True)
         approx = cv.approxPolyDP(cnt, EPSILON_RAMER_DOUGLAS_PEUCKER * peri, True)
+        if not angulo_valido(approx, 80, 125):
+            continue
+        x, y, w, h = cv.boundingRect(approx)
+        aspect_ratio = float(w) / float(h)
+        pts = approx.reshape(4, 2)
+        d1 = np.linalg.norm(pts[0] - pts[1])
+        d2 = np.linalg.norm(pts[1] - pts[2])
+        d3 = np.linalg.norm(pts[2] - pts[3])
+        d4 = np.linalg.norm(pts[3] - pts[0])
+        lados = [d1, d2, d3, d4]
+        min_lado = min(lados)
+        max_lado = max(lados)
+        if min_lado == 0:
+            continue
+        if (max_lado / min_lado) > 1.40: 
+            continue
+        if not (0.7 <= aspect_ratio <= 1.3):
+            continue
         if len(approx) == 4 and area > best_area:
             best = approx
             best_area = area
-
     if best is None:
         return None
 
@@ -154,8 +209,9 @@ def isolate_pointer(warped, template):
     Returns a binary mask where the pointer pixels are white.
     """
     diff = cv.absdiff(warped, template)
-    blurred = cv.medianBlur(diff, DIFF_BLUR_KSIZE)
-    _, mask = cv.threshold(blurred, DIFF_THRESHOLD, 255, cv.THRESH_BINARY)
+    _, mask = cv.threshold(diff, DIFF_THRESHOLD, 255, cv.THRESH_BINARY)
+    kernel = cv.getStructuringElement(cv.MORPH_RECT, (5, 5))
+    mask = cv.morphologyEx(mask, cv.MORPH_OPEN, kernel)
     return diff, mask
 
 
@@ -184,7 +240,7 @@ def pointer_angle_pca(mask):
     # the image center.  Project each pixel onto the eigenvector; pixels
     # with positive projection are on the +v side, negative on the -v side.
     # The side whose mean is farther from image center is the tip side.
-    img_center = np.array([mask.shape[1] / 2.0, mask.shape[0] / 2.0])
+    img_center = np.array([mask.shape[1] / 2.0, mask.shape[0] * PIVOT_Y_RATIO])
     projections = (coords - mean) @ eigenvectors[0]       # scalar per pixel
     pos_mask = projections > 0
     neg_mask = ~pos_mask
@@ -225,7 +281,7 @@ def pointer_angle_moments(mask):
     if coords is None:
         return None, None
     coords = coords.reshape(-1, 2).astype(np.float64)
-    img_center = np.array([mask.shape[1] / 2.0, mask.shape[0] / 2.0])
+    img_center = np.array([mask.shape[1] / 2.0, mask.shape[0] * PIVOT_Y_RATIO])
     mean = np.array([cx, cy])
     
     projections = (coords - mean) @ np.array([vx, vy])
@@ -273,7 +329,7 @@ def pointer_angle_hough(mask):
     if norm > 0:
         vx, vy = vx/norm, vy/norm
         
-    img_center = np.array([mask.shape[1] / 2.0, mask.shape[0] / 2.0])
+    img_center = np.array([mask.shape[1] / 2.0, mask.shape[0] * PIVOT_Y_RATIO])
     p1 = np.array([x1, y1])
     p2 = np.array([x2, y2])
     dist1 = np.linalg.norm(p1 - img_center)
@@ -333,7 +389,16 @@ def angle_to_pressure(angle_deg, angle_at_0=ANGLE_AT_0, angle_at_100=ANGLE_AT_10
     sweep = angle_at_0 - angle_at_100   # total angular sweep
     if sweep == 0:
         return 0.0
-    fraction = (angle_at_0 - angle_deg) / sweep
+    covered_distance = (angle_at_0 - angle_deg) % 360
+
+    if covered_distance > sweep:
+        dist_to_0 = 360 - covered_distance
+        dist_to_100 = covered_distance - sweep
+        if dist_to_0 < dist_to_100:
+            covered_distance = 0.0
+        else:
+            covered_distance = sweep
+    fraction = covered_distance / sweep
     pressure = fraction * 100.0
     return np.clip(pressure, 0.0, 100.0)
 
@@ -416,6 +481,23 @@ class ManometroDetector(Node):
         self._skip_log_time  = 0.0
         self._latest_debug_frame = None  # most recent annotated frame for saving
 
+        # Subscribe to pressure analysis to trigger image saving
+        self._save_dir = os.path.expanduser('~/evtol/manometro_readings')
+        os.makedirs(self._save_dir, exist_ok=True)
+        self.create_subscription(
+            String, '/pressure_analysis', self._save_callback, 10)
+
+    def _save_callback(self, msg):
+        """Save the annotated debug frame when a pressure measurement is published."""
+        if not msg.data or self._latest_debug_frame is None:
+            return
+        is_above = 'above' in msg.data
+        label    = 'ACIMA_DO_LIMITE' if is_above else 'DENTRO_DO_LIMITE'
+        ts       = datetime.now().strftime('%Y%m%d_%H%M%S')
+        filename = f'manometro_{ts}_{label}.jpg'
+        path     = os.path.join(self._save_dir, filename)
+        cv.imwrite(path, self._latest_debug_frame)
+        self.get_logger().info(f'[foto] Salva em {path}')
 
     def callback(self, msg):
         try:
@@ -440,7 +522,17 @@ class ManometroDetector(Node):
             result = find_square(binary)
             if result is not None:
                 corners, corner_sum = result
-                candidate_centro = (corner_sum / 4).astype(int)
+                centro_quadrado = (corner_sum / 4)
+                cornerCE = corners[0]
+                cornerCD = corners[1]
+                cornerBD = corners[2]
+                cornerBE = corners[3]
+                pontoMedioC = (cornerCD + cornerCE)/2
+                pontoMedioB = (cornerBD + cornerBE)/2
+                vetorBaixoCima = (pontoMedioC - pontoMedioB)
+                vetorCorretivo = vetorBaixoCima*0.06212
+                candidate_centro = (centro_quadrado + vetorCorretivo).astype(int)
+
                 quad_area = cv.contourArea(corners.astype(np.float32).reshape(4, 1, 2))
 
                 # Always draw candidate so the user can see what find_square found.
@@ -452,7 +544,7 @@ class ManometroDetector(Node):
                            cv.FONT_HERSHEY_SIMPLEX, 0.35, (0, 165, 255), 1)
 
                 # Area filter: 0.5% min (removes tiny noise), 70% max (removes horizon line)
-                if quad_area > 0.70 * img_area or quad_area < 0.005 * img_area:
+                if quad_area > 0.20 * img_area or quad_area < 0.005 * img_area:
                     now = time.time()
                     if now - self._skip_log_time >= 5.0:
                         self.get_logger().warn(
@@ -466,7 +558,16 @@ class ManometroDetector(Node):
 
             if result is not None:
                 corners, corner_sum = result
-                candidate_centro = (corner_sum / 4).astype(int)
+                centro_quadrado = (corner_sum / 4)
+                cornerCE = corners[0]
+                cornerCD = corners[1]
+                cornerBD = corners[2]
+                cornerBE = corners[3]
+                pontoMedioC = (cornerCD + cornerCE)/2
+                pontoMedioB = (cornerBD + cornerBE)/2
+                vetorBaixoCima = (pontoMedioC - pontoMedioB)
+                vetorCorretivo = vetorBaixoCima*0.06212
+                candidate_centro = (centro_quadrado + vetorCorretivo).astype(int)
 
                 warped = warp_to_square(gray, corners, TEMPLATE_SIZE)
                 _, warped_bin = cv.threshold(warped, 0, 255, cv.THRESH_BINARY | cv.THRESH_OTSU)
@@ -499,8 +600,10 @@ class ManometroDetector(Node):
                     r_mask, c_mask = get_circle_params(best_warped_bin)
                     if r_mask is not None and c_mask is not None:
                         c_mask_img = np.zeros_like(pointer_mask)
-                        adjusted_center = (c_mask[0] + ROI_OFFSET_X, c_mask[1] + ROI_OFFSET_Y)
-                        cv.circle(c_mask_img, adjusted_center, int(r_mask * ROI_RADIUS_RATIO), 255, -1)
+                        h_warped, w_warped = best_warped_bin.shape[:2]
+                        pivot_center = (int(w_warped/2.0), int(h_warped * PIVOT_Y_RATIO))
+                        cv.circle(c_mask_img, pivot_center, int(r_mask * ROI_RADIUS_RATIO), 255, -1)
+                        cv.circle(c_mask_img, pivot_center, int(r_mask * ROI_INV_RADIUS_RATIO), 0, -1)
                         pointer_mask = cv.bitwise_and(pointer_mask, c_mask_img)
 
                 # CRITICAL: only confirm detection when template subtraction passes.
@@ -529,12 +632,10 @@ class ManometroDetector(Node):
 
                         angle, _ = pointer_angle_pca(pointer_mask)
                         if angle is not None:
-                            angle = correct_angle_homography(angle, best_warped_bin)
+                            #angle = correct_angle_homography(angle, best_warped_bin)
                             # With correct (minimum-diff) rotation selected, the PCA angle
                             # is already in the template's coordinate frame — no correction needed.
-                            angle = ((angle + 180.0) % 360.0) - 180.0
-                            pressure = angle_to_pressure(
-                                angle, self._angle_at_0, self._angle_at_100)
+                            pressure = angle_to_pressure(angle, self._angle_at_0, self._angle_at_100)
                             pointer_mask_debug = pointer_mask.copy()
                             warped_debug = best_warped_bin.copy()
                             best_rot_debug = best_rot
@@ -584,12 +685,12 @@ class ManometroDetector(Node):
                 warped_color = cv.cvtColor(
                     cv.resize(warped_display, (inset_size, inset_size)), cv.COLOR_GRAY2BGR)
                 cx_i = inset_size // 2
-                cy_i = inset_size // 2
+                cy_i = int(inset_size * PIVOT_Y_RATIO)
                 line_len = int(inset_size * 0.40)
                 # The angle is already in the template (= inset) coordinate frame,
                 # so the arrow is drawn directly at `angle`.
-                lx = int(cx_i + line_len * np.cos(np.radians(angle)))
-                ly = int(cy_i - line_len * np.sin(np.radians(angle)))
+                lx = round(cx_i + line_len * np.cos(np.radians(angle)))
+                ly = round(cy_i - line_len * np.sin(np.radians(angle)))
                 cv.arrowedLine(warped_color, (cx_i, cy_i), (lx, ly), (0, 0, 255), 2, tipLength=0.3)
                 cv.putText(warped_color, f"{angle:.0f}d r{best_rot_debug}", (2, 12),
                            cv.FONT_HERSHEY_SIMPLEX, 0.35, (0, 200, 255), 1)
