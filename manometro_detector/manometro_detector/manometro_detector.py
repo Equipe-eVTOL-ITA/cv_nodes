@@ -1,5 +1,6 @@
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
 from sensor_msgs.msg import CompressedImage
 from std_msgs.msg import Float32, Int16MultiArray, String
 from geometry_msgs.msg import Point
@@ -95,21 +96,21 @@ def find_square(binary, frame):
             continue
         x, y, w, h = cv.boundingRect(approx)
         aspect_ratio = float(w) / float(h)
-        pts = approx.reshape(4, 2)
-        d1 = np.linalg.norm(pts[0] - pts[1])
-        d2 = np.linalg.norm(pts[1] - pts[2])
-        d3 = np.linalg.norm(pts[2] - pts[3])
-        d4 = np.linalg.norm(pts[3] - pts[0])
-        lados = [d1, d2, d3, d4]
-        min_lado = min(lados)
-        max_lado = max(lados)
-        if min_lado == 0:
-            continue
-        if (max_lado / min_lado) > 1.40: 
-            continue
-        if not (0.7 <= aspect_ratio <= 1.3):
-            continue
         if len(approx) == 4 and area > best_area:
+            pts = approx.reshape(4, 2)
+            d1 = np.linalg.norm(pts[0] - pts[1])
+            d2 = np.linalg.norm(pts[1] - pts[2])
+            d3 = np.linalg.norm(pts[2] - pts[3])
+            d4 = np.linalg.norm(pts[3] - pts[0])
+            lados = [d1, d2, d3, d4]
+            min_lado = min(lados)
+            max_lado = max(lados)
+            if min_lado == 0:
+                continue
+            if (max_lado / min_lado) > 1.40: 
+                continue
+            if not (0.7 <= aspect_ratio <= 1.3):
+                continue
             best = approx
             best_area = area
     if best is None:
@@ -408,11 +409,17 @@ class ManometroDetector(Node):
 
         self.bridge = CvBridge()
 
+        camera_qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE,
+            depth=10,
+        )
+
         self.img_sub = self.create_subscription(
             CompressedImage,
             '/vertical_camera/compressed',
             self.callback,
-            10 # QoS
+            camera_qos
         )
 
         self.pressure_pub = self.create_publisher(
@@ -519,7 +526,7 @@ class ManometroDetector(Node):
             h_img, w_img = frame.shape[:2]
             img_area = h_img * w_img
 
-            result = find_square(binary)
+            result = find_square(binary, frame)
             if result is not None:
                 corners, corner_sum = result
                 centro_quadrado = (corner_sum / 4)

@@ -48,6 +48,7 @@ class BouncingDetectorNode(Node):
 
         self.declare_parameter('debug_pub_interval', 0.2)
         self._debug_pub_interval = self.get_parameter('debug_pub_interval').get_parameter_value().double_value
+        # self._debug_pub_interval = 0.2
 
         qos = QoSProfile(
             history=QoSHistoryPolicy.KEEP_LAST,
@@ -74,7 +75,7 @@ class BouncingDetectorNode(Node):
 
         self.br = CvBridge()
         self.aruco_dict   = aruco.getPredefinedDictionary(aruco.DICT_5X5_100)
-        self.aruco_params = aruco.DetectorParameters()
+        self.aruco_params = aruco.DetectorParameters_create()
 
         # Latched target: persists across frames so base matching works even
         # when the ArUco is no longer in view (e.g. during SEARCH_BASE).
@@ -383,7 +384,7 @@ class BouncingDetectorNode(Node):
             debug_msg = self.br.cv2_to_compressed_imgmsg(output_frame)
             debug_msg.header = msg.header
             self.debug_pub_.publish(debug_msg)
-            now_s = self.get_clock().now().nanoseconds * 1e-9
+            now_s = self.get_clock().now()
             if (now_s - self._debug_last_pub_time) >= self._debug_pub_interval:
                 h, w = output_frame.shape[:2]
                 if w > self._debug_max_width:

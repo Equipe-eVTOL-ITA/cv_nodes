@@ -73,7 +73,7 @@ class RDPvisao(Node):
 
         # ArUco detector
         self.aruco_dict = aruco.getPredefinedDictionary(aruco.DICT_5X5_100)
-        self.aruco_params = aruco.DetectorParameters()
+        self.aruco_params = aruco.DetectorParameters_create()
 
         # Latched target
         self._cached_target_calculated = False
@@ -319,6 +319,7 @@ class RDPvisao(Node):
                         det_msg.target_base_in_sight = True
                 try:
                     self.publisher.publish(det_msg)
+                    self.get_logger().info("ACHEEEEEEI!!!!")
                 except Exception:
                     pass
             else:

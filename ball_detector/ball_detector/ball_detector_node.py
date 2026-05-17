@@ -45,17 +45,33 @@ class BallDetectorNode(Node):
 
         self.declare_parameter('debug_mask', True)
         self.declare_parameter('debug_image', True)
+        # Throttle debug image publishing for telemetry. <=0 means every frame.
+        self.declare_parameter('debug_publish_rate', 5.0)
+        # Downscale debug images before publishing. <=0 keeps detector size.
+        self.declare_parameter('debug_max_width', 320)
+        # JPEG quality for debug images (1..100). Lower => less bandwidth.
+        self.declare_parameter('debug_jpeg_quality', 60)
 
         self.publisher_ = self.create_publisher(BallDetection, 'ball_detection', 10)
         self.debug_pub_ = self.create_publisher(CompressedImage, 'ball_detection_image/compressed', _DBG_QOS)
         self.mask_pub_ = self.create_publisher(CompressedImage, 'ball_detector/mask/compressed', _DBG_QOS)
 
+        rate = float(self.get_parameter('debug_publish_rate').value)
+        self._debug_min_period = (1.0 / rate) if rate > 0.0 else 0.0
+        self._last_debug_pub_time = 0.0
+
         image_topic = self.get_parameter('image_topic').value
+        sensor_qos = QoSProfile(
+            history=QoSHistoryPolicy.KEEP_LAST,
+            depth=5,
+            reliability=QoSReliabilityPolicy.BEST_EFFORT,
+            durability=QoSDurabilityPolicy.VOLATILE,
+        )
         self.subscription = self.create_subscription(
             CompressedImage,
             image_topic,
             self.image_callback,
-            10,
+            sensor_qos,
         )
 
         self.br = CvBridge()
@@ -63,9 +79,31 @@ class BallDetectorNode(Node):
         self._frame_count = 0
         self.get_logger().info(f'Orange ball detector started. Subscribed to {image_topic}')
 
+    def _debug_should_publish(self):
+        """Time-based gate so debug topics respect debug_publish_rate (Hz)."""
+        if self._debug_min_period <= 0.0:
+            return True
+        now = self.get_clock().now().nanoseconds * 1e-9
+        if now - self._last_debug_pub_time >= self._debug_min_period:
+            self._last_debug_pub_time = now
+            return True
+        return False
+
     def _pub_debug(self, publisher, image, header):
         try:
-            msg = self.br.cv2_to_compressed_imgmsg(image)
+            max_w = int(self.get_parameter('debug_max_width').value)
+            if max_w > 0 and image.shape[1] > max_w:
+                scale = max_w / float(image.shape[1])
+                new_size = (max_w, max(1, int(image.shape[0] * scale)))
+                image = cv2.resize(image, new_size)
+
+            q = int(self.get_parameter('debug_jpeg_quality').value)
+            ok, buf = cv2.imencode('.jpg', image, [int(cv2.IMWRITE_JPEG_QUALITY), q])
+            if not ok:
+                return
+            msg = CompressedImage()
+            msg.format = 'jpeg'
+            msg.data = buf.tobytes()
             msg.header = header
             publisher.publish(msg)
         except Exception as exc:
@@ -114,7 +152,12 @@ class BallDetectorNode(Node):
             mask[:r, :]         = 0  # banda superior
             mask[height - r:, :] = 0  # banda inferior
 
-        if bool(self.get_parameter('debug_mask').value):
+        publish_debug = (
+            bool(self.get_parameter('debug_mask').value) or
+            bool(self.get_parameter('debug_image').value)
+        ) and self._debug_should_publish()
+
+        if publish_debug and bool(self.get_parameter('debug_mask').value):
             mask_dbg = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
             cv2.putText(mask_dbg, f'orange px={int(np.count_nonzero(mask))}', (10, 30),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
@@ -204,7 +247,7 @@ class BallDetectorNode(Node):
 
         self.publisher_.publish(det_msg)
 
-        if bool(self.get_parameter('debug_image').value):
+        if publish_debug and bool(self.get_parameter('debug_image').value):
             # Desenha bordas da ROI no debug
             if r > 0:
                 cv2.line(output, (0, r),          (width, r),          (255, 255, 0), 1)

@@ -19,9 +19,9 @@ import math
 import cv2
 import numpy as np
 import rclpy
-from cv_bridge import CvBridge, CvBridgeError
+from cv_bridge import CvBridge
 from rclpy.node import Node
-from rclpy.qos import QoSProfile
+from rclpy.qos import QoSDurabilityPolicy, QoSHistoryPolicy, QoSProfile, QoSReliabilityPolicy
 from sensor_msgs.msg import CompressedImage, Image
 from geometry_msgs.msg import PointStamped
 from std_msgs.msg import Float64
@@ -39,6 +39,15 @@ from .line_utils import (
 )
 
 _DBG_QOS = QoSProfile(depth=5)
+
+# Match camera_publisher (BEST_EFFORT, VOLATILE) so subscriptions
+# to /vertical_camera/compressed actually receive frames.
+_SENSOR_QOS = QoSProfile(
+    history=QoSHistoryPolicy.KEEP_LAST,
+    depth=5,
+    reliability=QoSReliabilityPolicy.BEST_EFFORT,
+    durability=QoSDurabilityPolicy.VOLATILE,
+)
 
 
 class MangueiraDetector(Node):
@@ -93,6 +102,12 @@ class MangueiraDetector(Node):
         # ============ Debug parameters ============
         self.declare_parameter('debug_mask', True)
         self.declare_parameter('debug_image', True)
+        # Throttle debug image publishing for telemetry. <=0 means every frame.
+        self.declare_parameter('debug_publish_rate', 5.0)
+        # Downscale debug images before publishing. <=0 keeps detector size.
+        self.declare_parameter('debug_max_width', 320)
+        # JPEG quality for debug images (1..100). Lower => less bandwidth.
+        self.declare_parameter('debug_jpeg_quality', 60)
 
         # ============ ROS infrastructure ============
         image_topic = self.get_parameter('image_topic').value
@@ -101,10 +116,17 @@ class MangueiraDetector(Node):
         self.pos_pub = self.create_publisher(PointStamped, '/mangueira/position', 10)
         self.angle_pub = self.create_publisher(Float64, '/mangueira/angle', 10)
         self.detections_pub = self.create_publisher(Detection2DArray, '/mangueira/detections', 10)
-        self.image_pub = self.create_publisher(Image, '/mangueira_detector/image', 10)
-        self.mask_pub = self.create_publisher(Image, '/mangueira_detector/mask', _DBG_QOS)
+        # Debug images published as CompressedImage to save telemetry bandwidth.
+        self.image_pub = self.create_publisher(
+            CompressedImage, '/mangueira_detector/image/compressed', _DBG_QOS)
+        self.mask_pub = self.create_publisher(
+            CompressedImage, '/mangueira_detector/mask/compressed', _DBG_QOS)
 
-        self.sub = self.create_subscription(CompressedImage, image_topic, self.image_callback, 10)
+        rate = float(self.get_parameter('debug_publish_rate').value)
+        self._debug_min_period = (1.0 / rate) if rate > 0.0 else 0.0
+        self._last_debug_pub_time = 0.0
+
+        self.sub = self.create_subscription(CompressedImage, image_topic, self.image_callback, _SENSOR_QOS)
 
         # ============ State for temporal smoothing ============
         smoothing_window = int(self.get_parameter('smoothing_window').value)
@@ -118,6 +140,37 @@ class MangueiraDetector(Node):
             f'  ROI enabled: {self.get_parameter("roi_enable").value}\n'
             f'  Smoothing window: {smoothing_window}'
         )
+
+    def _debug_should_publish(self):
+        """Time-based gate so debug topics respect debug_publish_rate (Hz)."""
+        if self._debug_min_period <= 0.0:
+            return True
+        now = self.get_clock().now().nanoseconds * 1e-9
+        if now - self._last_debug_pub_time >= self._debug_min_period:
+            self._last_debug_pub_time = now
+            return True
+        return False
+
+    def _pub_debug_compressed(self, publisher, image, header):
+        """Downscale + JPEG-encode a BGR image and publish as CompressedImage."""
+        try:
+            max_w = int(self.get_parameter('debug_max_width').value)
+            if max_w > 0 and image.shape[1] > max_w:
+                scale = max_w / float(image.shape[1])
+                new_size = (max_w, max(1, int(image.shape[0] * scale)))
+                image = cv2.resize(image, new_size)
+
+            q = int(self.get_parameter('debug_jpeg_quality').value)
+            ok, buf = cv2.imencode('.jpg', image, [int(cv2.IMWRITE_JPEG_QUALITY), q])
+            if not ok:
+                return
+            msg = CompressedImage()
+            msg.format = 'jpeg'
+            msg.data = buf.tobytes()
+            msg.header = header
+            publisher.publish(msg)
+        except Exception as exc:
+            self.get_logger().error(f'Failed to publish debug image: {exc}')
 
     def _build_red_mask(self, frame_bgr):
         # Build red mask using two HSV ranges to handle hue wrap-around
@@ -186,17 +239,16 @@ class MangueiraDetector(Node):
             }
             mask = apply_roi_mask(mask, roi_type=roi_type, roi_params=roi_params)
 
-        # Debug: publish mask as Image
-        if bool(self.get_parameter('debug_mask').value):
-            try:
-                mask_dbg = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
-                cv2.putText(mask_dbg, f'orange px={int(np.count_nonzero(mask))}', (10, 30),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-                mask_msg = self.bridge.cv2_to_imgmsg(mask_dbg, encoding='bgr8')
-                mask_msg.header = msg.header
-                self.mask_pub.publish(mask_msg)
-            except CvBridgeError as e:
-                self.get_logger().error(f'Failed to publish mask image: {e}')
+        publish_debug = (
+            bool(self.get_parameter('debug_mask').value) or
+            bool(self.get_parameter('debug_image').value)
+        ) and self._debug_should_publish()
+
+        if publish_debug and bool(self.get_parameter('debug_mask').value):
+            mask_dbg = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
+            cv2.putText(mask_dbg, f'orange px={int(np.count_nonzero(mask))}', (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+            self._pub_debug_compressed(self.mask_pub, mask_dbg, msg.header)
 
         # ============ Step 3: Canny edge detection ============
         canny_low = int(self.get_parameter('canny_low').value)
@@ -321,7 +373,7 @@ class MangueiraDetector(Node):
         self.detections_pub.publish(detection_array)
 
         # ============ Step 9: Annotate and debug publish ============
-        if bool(self.get_parameter('debug_image').value):
+        if publish_debug and bool(self.get_parameter('debug_image').value):
             # Draw all detected lines faintly
             if line_data:
                 for slope, intercept, length, x1, y1, x2, y2 in line_data:
@@ -361,12 +413,7 @@ class MangueiraDetector(Node):
             else:
                 cv2.putText(annotated, 'no line detected', (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
-            try:
-                ann_msg = self.bridge.cv2_to_imgmsg(annotated, encoding='bgr8')
-                ann_msg.header = msg.header
-                self.image_pub.publish(ann_msg)
-            except CvBridgeError as e:
-                self.get_logger().error(f'Failed to publish annotated image: {e}')
+            self._pub_debug_compressed(self.image_pub, annotated, msg.header)
 
 
 def main(args=None):
