@@ -136,6 +136,166 @@ This matches the `webcam_publisher` QoS profile. A `RELIABLE` subscriber will no
 
 ---
 
+## Configuring mission launch files
+
+Every mission that uses a CV node based on `Detector` must follow this pattern in both `simulation.launch.py` and `flight.launch.py`.
+
+### Step 1 — Resolve the detector's YAML path
+
+Each CV package installs its own YAML to its share directory. Load it with `get_package_share_directory` — **never** point to the mission's own YAML for the detector node.
+
+```python
+from ament_index_python.packages import get_package_share_directory
+import os
+
+# Mission params (FSM node only)
+pkg_mission = get_package_share_directory('mission_X')
+mission_params = os.path.join(pkg_mission, 'config', 'simulation.yaml')  # or flight.yaml
+
+# Detector params (CV node only) — separate file, separate package
+pkg_my_detector = get_package_share_directory('my_detector_package')
+detector_params = os.path.join(pkg_my_detector, 'config', 'my_detector.yaml')
+```
+
+> **Why separate?** Mission YAMLs are keyed on `mission_X_node:`. A detector node named `my_detector` will not find any matching key there and silently use defaults for every parameter.
+
+### Step 2 — Declare the webcam publisher with an explicit camera_name
+
+The `camera_name` parameter determines the topic name published by `webcam_publisher`:
+
+| `camera_name` | Topic published |
+|---|---|
+| `'vertical'` | `/vertical_camera/compressed` |
+| `'horizontal'` | `/horizontal_camera/compressed` |
+
+Always set it explicitly so the topic is predictable and matches `image_topic` in the detector YAML.
+
+```python
+webcam_node = Node(
+    package='camera_publisher',
+    executable='webcam',
+    parameters=[{
+        'video_source': '/dev/video2',   # adjust to your device
+        'camera_name': 'vertical',       # → /vertical_camera/compressed
+    }],
+    output='screen',
+)
+```
+
+For simulation launches that do not start a real camera, omit this node entirely.
+
+### Step 3 — Pass the detector YAML to the CV node
+
+```python
+vision_node = Node(
+    package='my_detector_package',
+    executable='my_detector_node',
+    parameters=[detector_params],   # detector YAML, not the mission YAML
+    output='screen',
+)
+```
+
+### Step 4 — Pass only the mission YAML to the FSM node
+
+```python
+fsm_node = Node(
+    package='mission_X',
+    executable='mission_X',
+    parameters=[mission_params],    # mission YAML only
+    output='screen',
+    prefix='nice -n -10',           # higher CPU priority than vision nodes
+)
+```
+
+### Step 5 — Verify image_topic consistency
+
+Open the detector YAML and confirm that `image_topic` matches the topic the camera publishes:
+
+```yaml
+# my_detector_package/config/my_detector.yaml
+my_detector:
+  ros__parameters:
+    image_topic: '/vertical_camera/compressed'   # must match camera_name in webcam_node
+```
+
+If they differ the detector will start silently and receive zero frames.
+
+### Complete example
+
+```python
+#!/usr/bin/env python3
+from launch import LaunchDescription
+from launch_ros.actions import Node
+from launch.actions import DeclareLaunchArgument, TimerAction
+from launch.substitutions import LaunchConfiguration
+from ament_index_python.packages import get_package_share_directory
+import os
+
+def generate_launch_description():
+
+    pkg_mission   = get_package_share_directory('mission_X')
+    mission_params = os.path.join(pkg_mission, 'config', 'flight.yaml')  # or simulation.yaml
+
+    pkg_detector   = get_package_share_directory('my_detector_package')
+    detector_params = os.path.join(pkg_detector, 'config', 'my_detector.yaml')
+
+    webcam_node = Node(
+        package='camera_publisher',
+        executable='webcam',
+        parameters=[{
+            'video_source': '/dev/video2',
+            'camera_name': 'vertical',
+        }],
+        output='screen',
+    )
+
+    vision_node = Node(
+        package='my_detector_package',
+        executable='my_detector_node',
+        parameters=[detector_params],
+        output='screen',
+    )
+
+    fsm_node = Node(
+        package='mission_X',
+        executable=LaunchConfiguration('mission'),
+        parameters=[mission_params],
+        output='screen',
+        prefix='nice -n -10',
+    )
+
+    return LaunchDescription([
+        DeclareLaunchArgument('mission', default_value='mission_X'),
+        webcam_node,
+        vision_node,
+        TimerAction(period=5.0, actions=[fsm_node]),
+    ])
+```
+
+### Disabling debug topics at launch time
+
+Debug image topics can be silenced without editing the YAML by overriding parameters inline:
+
+```python
+vision_node = Node(
+    package='my_detector_package',
+    executable='my_detector_node',
+    parameters=[
+        detector_params,
+        {'debug_image': False, 'debug_mask': False},  # override for flight
+    ],
+    output='screen',
+)
+```
+
+Or from the command line:
+```bash
+ros2 launch mission_X flight.launch.py \
+  --ros-args -r my_detector_node:debug_image:=false
+```
+
+---
+
 ## Example: orange circle detector
 
 ```python

@@ -1,10 +1,8 @@
 import rclpy
-from rclpy.node import Node
-from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
 from sensor_msgs.msg import CompressedImage
 from std_msgs.msg import Float32, Int16MultiArray, String
 from geometry_msgs.msg import Point
-from cv_bridge import CvBridge
+from detector.detector import Detector
 
 import cv2 as cv
 import numpy as np
@@ -403,24 +401,9 @@ def angle_to_pressure(angle_deg, angle_at_0=ANGLE_AT_0, angle_at_100=ANGLE_AT_10
     pressure = fraction * 100.0
     return np.clip(pressure, 0.0, 100.0)
 
-class ManometroDetector(Node):
+class ManometroDetector(Detector):
     def __init__(self):
-        super().__init__('manometro_detector')
-
-        self.bridge = CvBridge()
-
-        camera_qos = QoSProfile(
-            reliability=ReliabilityPolicy.BEST_EFFORT,
-            durability=DurabilityPolicy.VOLATILE,
-            depth=10,
-        )
-
-        self.img_sub = self.create_subscription(
-            CompressedImage,
-            '/vertical_camera/compressed',
-            self.callback,
-            camera_qos
-        )
+        super().__init__('manometro_detector')  # handles camera sub, bridge, debug params
 
         self.pressure_pub = self.create_publisher(
             Float32,
@@ -506,11 +489,10 @@ class ManometroDetector(Node):
         cv.imwrite(path, self._latest_debug_frame)
         self.get_logger().info(f'[foto] Salva em {path}')
 
-    def callback(self, msg):
+    def process_frame(self, frame, header):
         try:
             pressure = -1.0
 
-            frame = self.bridge.compressed_imgmsg_to_cv2(msg)
             debug_frame = frame.copy()
 
             gray = cv.cvtColor(frame, cv.COLOR_BGR2GRAY)
@@ -727,16 +709,8 @@ class ManometroDetector(Node):
                 err_msg.y = float('nan')
             self.error_pub.publish(err_msg)
 
-            # Store latest frame for saving when pressure_analysis fires
-            self._latest_debug_frame = debug_frame.copy()
-
-            # Publish debug image
-            try:
-                debug_msg = self.bridge.cv2_to_compressed_imgmsg(debug_frame)
-                debug_msg.header = msg.header
-                self.debug_pub.publish(debug_msg)
-            except Exception as e:
-                self.get_logger().error(f"Failed to publish debug image: {e}")
+            if bool(self.get_parameter('debug_image').value):
+                self._pub_debug(self.debug_pub, debug_frame, header)
 
         except Exception as e:
             self.get_logger().error(f"Erro no callback de imagem: {str(e)}")

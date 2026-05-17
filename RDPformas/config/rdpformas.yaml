@@ -1,0 +1,13 @@
+rdpvisao_node:
+  ros__parameters:
+
+    # ---- Câmera ----
+    image_topic: '/vertical_camera/compressed'
+    processing_frequency: 0.0     # 0 = todo frame (OCR é assíncrono, não bloqueia)
+
+    # ---- Debug ----
+    debug_image: true
+    debug_mask: false
+    debug_publish_rate: 2.0       # Hz (equivalente ao antigo debug_pub_interval=0.5s)
+    debug_max_width: 640
+    debug_jpeg_quality: 60
