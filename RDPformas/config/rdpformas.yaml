@@ -3,10 +3,10 @@ rdpvisao_node:
 
     # ---- Câmera ----
     image_topic: '/vertical_camera/compressed'
-    processing_frequency: 0.0     # 0 = todo frame (OCR é assíncrono, não bloqueia)
+    processing_frequency: 10.0    # Hz; deve coincidir com publish_rate do webcam_publisher
 
     # ---- Debug ----
-    debug_image: true
+    debug_image: false
     debug_mask: false
     debug_publish_rate: 2.0       # Hz (equivalente ao antigo debug_pub_interval=0.5s)
     debug_max_width: 640

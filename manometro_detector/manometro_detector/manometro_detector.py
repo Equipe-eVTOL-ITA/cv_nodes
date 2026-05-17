@@ -470,6 +470,7 @@ class ManometroDetector(Detector):
         self._miss_log_time  = 0.0
         self._skip_log_time  = 0.0
         self._latest_debug_frame = None  # most recent annotated frame for saving
+        self.frame_photo = None
 
         # Subscribe to pressure analysis to trigger image saving
         self._save_dir = os.path.expanduser('~/evtol/manometro_readings')
@@ -479,19 +480,25 @@ class ManometroDetector(Detector):
 
     def _save_callback(self, msg):
         """Save the annotated debug frame when a pressure measurement is published."""
-        if not msg.data or self._latest_debug_frame is None:
+        #if not msg.data or self._latest_debug_frame is None:
+        #    return
+        if not msg.data or self.frame_photo is None:
+            self.get_logger().warn("No frame available to save.")
             return
         is_above = 'above' in msg.data
         label    = 'ACIMA_DO_LIMITE' if is_above else 'DENTRO_DO_LIMITE'
         ts       = datetime.now().strftime('%Y%m%d_%H%M%S')
         filename = f'manometro_{ts}_{label}.jpg'
         path     = os.path.join(self._save_dir, filename)
-        cv.imwrite(path, self._latest_debug_frame)
+        cv.imwrite(path, self.frame_photo)
         self.get_logger().info(f'[foto] Salva em {path}')
 
     def process_frame(self, frame, header):
+        self.frame_photo = None
         try:
             pressure = -1.0
+
+            self.frame_photo = frame.copy()  # Save original frame for photo saving
 
             debug_frame = frame.copy()
 
