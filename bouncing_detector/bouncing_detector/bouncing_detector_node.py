@@ -74,8 +74,13 @@ class BouncingDetectorNode(Node):
         )
 
         self.br = CvBridge()
+        # API do ArUco a partir do OpenCV 4.7: dicionário + parâmetros são
+        # passados ao construtor de ArucoDetector, e a detecção é um método do
+        # detector. As funções livres equivalentes (DetectorParameters_create,
+        # detectMarkers) foram removidas de forma inconsistente entre versões.
         self.aruco_dict   = aruco.getPredefinedDictionary(aruco.DICT_5X5_100)
-        self.aruco_params = aruco.DetectorParameters_create()
+        self.aruco_params = aruco.DetectorParameters()
+        self.aruco_detector = aruco.ArucoDetector(self.aruco_dict, self.aruco_params)
 
         # Latched target: persists across frames so base matching works even
         # when the ArUco is no longer in view (e.g. during SEARCH_BASE).
@@ -244,8 +249,7 @@ class BouncingDetectorNode(Node):
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
         # ---- 1. ArUco detection ----------------------------------------
-        corners, ids, _ = aruco.detectMarkers(gray, self.aruco_dict,
-                                              parameters=self.aruco_params)
+        corners, ids, _ = self.aruco_detector.detectMarkers(gray)
 
         if ids is not None and len(ids) > 0:
             aruco.drawDetectedMarkers(output_frame, corners, ids)
