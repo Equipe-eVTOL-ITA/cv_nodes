@@ -61,12 +61,13 @@ class RDPvisao(Detector):
         self._pending_ocr = []  # list of tuples (future, header, shape, bcx, bcy)
         self._jpeg_quality = 60
 
-        # ArUco detector (compatible with OpenCV >= 4.7 new API)
+        # API do ArUco a partir do OpenCV 4.7: dicionário + parâmetros vão para
+        # o construtor de ArucoDetector, e a detecção é um método do detector.
+        # As funções livres equivalentes foram removidas de forma inconsistente
+        # entre versões — no 4.11, por exemplo, aruco.detectMarkers não existe.
         self.aruco_dict = aruco.getPredefinedDictionary(aruco.DICT_5X5_100)
-        if hasattr(aruco, 'DetectorParameters_create'):
-            self.aruco_params = aruco.DetectorParameters_create()  # legacy API (<=4.6)
-        else:
-            self.aruco_params = aruco.DetectorParameters()         # new API (>=4.7)
+        self.aruco_params = aruco.DetectorParameters()
+        self.aruco_detector = aruco.ArucoDetector(self.aruco_dict, self.aruco_params)
 
         # Latched target
         self._cached_target_calculated = False
@@ -329,8 +330,7 @@ class RDPvisao(Detector):
         gray = cv.cvtColor(frame, cv.COLOR_BGR2GRAY)
 
         # Detecçao do ArUco
-        corners, ids, _ = aruco.detectMarkers(gray, self.aruco_dict,
-                                              parameters=self.aruco_params)
+        corners, ids, _ = self.aruco_detector.detectMarkers(gray)
 
         if ids is not None and len(ids) > 0:
             aruco.drawDetectedMarkers(outputRDP, corners, ids)
