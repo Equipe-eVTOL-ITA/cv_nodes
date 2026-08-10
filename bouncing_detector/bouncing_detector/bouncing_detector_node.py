@@ -13,16 +13,23 @@ from rclpy.qos import (
     QoSDurabilityPolicy
 )
 
+# easyocr e pytesseract sao OPCIONAIS: sem eles o no cai para a
+# classificacao por contorno. Por isso o except tem que ser largo.
+#
+# `except ImportError` nao bastava: um par torch/torchvision incompativel faz
+# o `import easyocr` levantar RuntimeError ("operator torchvision::nms does
+# not exist"), que passava direto pelo guard e DERRUBAVA o no na importacao.
+# Uma dependencia opcional nunca pode impedir o no de subir.
 try:
     import easyocr as _easyocr
     EASYOCR_AVAILABLE = True
-except ImportError:
+except Exception:
     EASYOCR_AVAILABLE = False
 
 try:
     import pytesseract
     PYTESSERACT_AVAILABLE = True
-except ImportError:
+except Exception:
     PYTESSERACT_AVAILABLE = False
 
 
