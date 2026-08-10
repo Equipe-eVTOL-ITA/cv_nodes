@@ -1,9 +1,8 @@
 import rclpy
-from rclpy.node import Node
 from sensor_msgs.msg import CompressedImage
 from std_msgs.msg import Float32, Int16MultiArray, String
 from geometry_msgs.msg import Point
-from cv_bridge import CvBridge
+from detector.detector import Detector
 
 import cv2 as cv
 import numpy as np
@@ -95,21 +94,21 @@ def find_square(binary, frame):
             continue
         x, y, w, h = cv.boundingRect(approx)
         aspect_ratio = float(w) / float(h)
-        pts = approx.reshape(4, 2)
-        d1 = np.linalg.norm(pts[0] - pts[1])
-        d2 = np.linalg.norm(pts[1] - pts[2])
-        d3 = np.linalg.norm(pts[2] - pts[3])
-        d4 = np.linalg.norm(pts[3] - pts[0])
-        lados = [d1, d2, d3, d4]
-        min_lado = min(lados)
-        max_lado = max(lados)
-        if min_lado == 0:
-            continue
-        if (max_lado / min_lado) > 1.40: 
-            continue
-        if not (0.7 <= aspect_ratio <= 1.3):
-            continue
         if len(approx) == 4 and area > best_area:
+            pts = approx.reshape(4, 2)
+            d1 = np.linalg.norm(pts[0] - pts[1])
+            d2 = np.linalg.norm(pts[1] - pts[2])
+            d3 = np.linalg.norm(pts[2] - pts[3])
+            d4 = np.linalg.norm(pts[3] - pts[0])
+            lados = [d1, d2, d3, d4]
+            min_lado = min(lados)
+            max_lado = max(lados)
+            if min_lado == 0:
+                continue
+            if (max_lado / min_lado) > 1.40: 
+                continue
+            if not (0.7 <= aspect_ratio <= 1.3):
+                continue
             best = approx
             best_area = area
     if best is None:
@@ -402,18 +401,9 @@ def angle_to_pressure(angle_deg, angle_at_0=ANGLE_AT_0, angle_at_100=ANGLE_AT_10
     pressure = fraction * 100.0
     return np.clip(pressure, 0.0, 100.0)
 
-class ManometroDetector(Node):
+class ManometroDetector(Detector):
     def __init__(self):
-        super().__init__('manometro_detector')
-
-        self.bridge = CvBridge()
-
-        self.img_sub = self.create_subscription(
-            CompressedImage,
-            '/vertical_camera/compressed',
-            self.callback,
-            10 # QoS
-        )
+        super().__init__('manometro_detector')  # handles camera sub, bridge, debug params
 
         self.pressure_pub = self.create_publisher(
             Float32,
@@ -480,6 +470,7 @@ class ManometroDetector(Node):
         self._miss_log_time  = 0.0
         self._skip_log_time  = 0.0
         self._latest_debug_frame = None  # most recent annotated frame for saving
+        self.frame_photo = None
 
         # Subscribe to pressure analysis to trigger image saving
         self._save_dir = os.path.expanduser('~/evtol/manometro_readings')
@@ -489,21 +480,26 @@ class ManometroDetector(Node):
 
     def _save_callback(self, msg):
         """Save the annotated debug frame when a pressure measurement is published."""
-        if not msg.data or self._latest_debug_frame is None:
+        #if not msg.data or self._latest_debug_frame is None:
+        #    return
+        if not msg.data or self.frame_photo is None:
+            self.get_logger().warn("No frame available to save.")
             return
         is_above = 'above' in msg.data
         label    = 'ACIMA_DO_LIMITE' if is_above else 'DENTRO_DO_LIMITE'
         ts       = datetime.now().strftime('%Y%m%d_%H%M%S')
         filename = f'manometro_{ts}_{label}.jpg'
         path     = os.path.join(self._save_dir, filename)
-        cv.imwrite(path, self._latest_debug_frame)
+        cv.imwrite(path, self.frame_photo)
         self.get_logger().info(f'[foto] Salva em {path}')
 
-    def callback(self, msg):
+    def process_frame(self, frame, header):
+        self.frame_photo = None
         try:
             pressure = -1.0
 
-            frame = self.bridge.compressed_imgmsg_to_cv2(msg)
+            self.frame_photo = frame.copy()  # Save original frame for photo saving
+
             debug_frame = frame.copy()
 
             gray = cv.cvtColor(frame, cv.COLOR_BGR2GRAY)
@@ -519,7 +515,7 @@ class ManometroDetector(Node):
             h_img, w_img = frame.shape[:2]
             img_area = h_img * w_img
 
-            result = find_square(binary)
+            result = find_square(binary, frame)
             if result is not None:
                 corners, corner_sum = result
                 centro_quadrado = (corner_sum / 4)
@@ -720,16 +716,8 @@ class ManometroDetector(Node):
                 err_msg.y = float('nan')
             self.error_pub.publish(err_msg)
 
-            # Store latest frame for saving when pressure_analysis fires
-            self._latest_debug_frame = debug_frame.copy()
-
-            # Publish debug image
-            try:
-                debug_msg = self.bridge.cv2_to_compressed_imgmsg(debug_frame)
-                debug_msg.header = msg.header
-                self.debug_pub.publish(debug_msg)
-            except Exception as e:
-                self.get_logger().error(f"Failed to publish debug image: {e}")
+            if bool(self.get_parameter('debug_image').value):
+                self._pub_debug(self.debug_pub, debug_frame, header)
 
         except Exception as e:
             self.get_logger().error(f"Erro no callback de imagem: {str(e)}")

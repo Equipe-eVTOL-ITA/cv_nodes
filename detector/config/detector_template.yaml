@@ -1,0 +1,43 @@
+# Template YAML para pacotes de visão computacional baseados em Detector.
+# Copie para config/ do seu pacote, renomeie e ajuste os valores.
+#
+# Como carregar no launch file:
+#   parameters=[os.path.join(pkg_dir, 'config', 'meu_detector.yaml')]
+#
+# O nome do nó (primeira chave) deve coincidir com o nome passado para
+# super().__init__('nome_do_no') no construtor da subclasse.
+
+nome_do_no:
+  ros__parameters:
+
+    # ── Câmera ─────────────────────────────────────────────────────────
+    # Opções típicas do webcam_publisher (camera_name_camera/compressed):
+    #   /vertical_camera/compressed    câmera downward (olha para baixo)
+    #   /horizontal_camera/compressed  câmera frontal  (olha para frente)
+    image_topic: '/vertical_camera/compressed'
+
+    # Frequência máxima de processamento em Hz.
+    # Frames recebidos mais rápido que isso são descartados sem processar.
+    # Use 0.0 para processar todos os frames (sem limitação).
+    processing_frequency: 10.0
+
+    # ── Debug ───────────────────────────────────────────────────────────
+    # Desabilite em voo para economizar largura de banda de telemetria.
+
+    # Publica o frame de saída anotado com detecções.
+    debug_image: true
+
+    # Publica a máscara binária intermediária da detecção.
+    debug_mask: false
+
+    # Taxa de publicação das imagens de debug em Hz.
+    # 0.0 = publica junto com cada frame processado (sem throttle adicional).
+    debug_publish_rate: 5.0
+
+    # Redimensiona imagens de debug antes de publicar (reduz bandwidth).
+    # 0 = sem resize (mantém a largura de processamento do detector).
+    debug_max_width: 320
+
+    # Qualidade JPEG das imagens de debug (1-100).
+    # Valores menores = mensagens menores = menos banda.
+    debug_jpeg_quality: 60

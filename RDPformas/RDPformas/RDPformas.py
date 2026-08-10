@@ -2,55 +2,52 @@ import cv2 as cv
 import numpy as np
 import math
 import rclpy
-from rclpy.node import Node
 from sensor_msgs.msg import CompressedImage
 from custom_msgs.msg import BouncingDetection
-from cv_bridge import CvBridge
 from rclpy.qos import (
     QoSProfile,
     QoSReliabilityPolicy,
     QoSHistoryPolicy,
-    QoSDurabilityPolicy
+    QoSDurabilityPolicy,
 )
 import concurrent.futures
 import cv2.aruco as aruco
+from detector.detector import Detector
 
+# easyocr e pytesseract sao OPCIONAIS: sem eles o no cai para a
+# classificacao por contorno. Por isso o except tem que ser largo.
+#
+# `except ImportError` nao bastava: um par torch/torchvision incompativel faz
+# o `import easyocr` levantar RuntimeError ("operator torchvision::nms does
+# not exist"), que passava direto pelo guard e DERRUBAVA o no na importacao.
+# Uma dependencia opcional nunca pode impedir o no de subir.
 try:
     import easyocr
     EASYOCR_AVAILABLE = True
-except ImportError:
+except Exception:
     EASYOCR_AVAILABLE = False
 try:
     import pytesseract
     PYTESSERACT_AVAILABLE = True
-except ImportError:
+except Exception:
     PYTESSERACT_AVAILABLE = False
 
-class RDPvisao(Node):
+class RDPvisao(Detector):
     def __init__(self):
-        super().__init__('rdpvisao_node')
+        super().__init__('rdpvisao_node')  # handles camera sub, bridge, debug params
 
-        self.declare_parameter('vertical_camera_topic', '/vertical_camera/compressed')
-        camera_topic = self.get_parameter('vertical_camera_topic').get_parameter_value().string_value
-
-        qos = QoSProfile(
+        _dbg_qos = QoSProfile(
             history=QoSHistoryPolicy.KEEP_LAST,
-            depth=1,
+            depth=5,
             reliability=QoSReliabilityPolicy.BEST_EFFORT,
-            durability=QoSDurabilityPolicy.VOLATILE
+            durability=QoSDurabilityPolicy.VOLATILE,
         )
-
-        # subscreve no tópico da câmera
-        self.create_subscription(CompressedImage, camera_topic, self.image_callback, qos)
-
-        self.bridge = CvBridge()
 
         # Publisher para as detecções
         self.publisher = self.create_publisher(BouncingDetection, 'bouncing_detection', 10)
 
-
         # publisher para debug de imagem
-        self.debug_pub = self.create_publisher(CompressedImage, 'bouncing_detection_image/compressed', qos)
+        self.debug_pub = self.create_publisher(CompressedImage, 'bouncing_detection_image/compressed', _dbg_qos)
 
         # OCR setup
         self._ocr = None
@@ -71,9 +68,13 @@ class RDPvisao(Node):
         self._pending_ocr = []  # list of tuples (future, header, shape, bcx, bcy)
         self._jpeg_quality = 60
 
-        # ArUco detector
+        # API do ArUco a partir do OpenCV 4.7: dicionário + parâmetros vão para
+        # o construtor de ArucoDetector, e a detecção é um método do detector.
+        # As funções livres equivalentes foram removidas de forma inconsistente
+        # entre versões — no 4.11, por exemplo, aruco.detectMarkers não existe.
         self.aruco_dict = aruco.getPredefinedDictionary(aruco.DICT_5X5_100)
         self.aruco_params = aruco.DetectorParameters()
+        self.aruco_detector = aruco.ArucoDetector(self.aruco_dict, self.aruco_params)
 
         # Latched target
         self._cached_target_calculated = False
@@ -85,11 +86,6 @@ class RDPvisao(Node):
         self._aruco_seen_frames = 0
         self._ARUCO_SEEN_PERSISTENCE = 8  # frames (~0.4s at 20Hz)
 
-        # Ajustes para telemetria de debug
-        self.declare_parameter('debug_pub_interval', 0.5)
-        self._debug_pub_interval = float(self.get_parameter('debug_pub_interval').get_parameter_value().double_value)
-        self._debug_last_pub_time = 0.0
-        self._debug_max_width = 640
 
 
     def angulo_valido(self, approx, limite_min_graus=20, limite_max_graus=150):
@@ -319,36 +315,29 @@ class RDPvisao(Node):
                         det_msg.target_base_in_sight = True
                 try:
                     self.publisher.publish(det_msg)
+                    self.get_logger().info("ACHEEEEEEI!!!!")
                 except Exception:
                     pass
             else:
                 remaining.append((future, header, shape, bcx, bcy))
         self._pending_ocr = remaining
 
-    def image_callback(self, msg):
+    def process_frame(self, frame, header):
         try:
             self._process_pending_ocr()
         except Exception:
             pass
 
-        # Converte a imagem
-        try:
-            frame = self.bridge.compressed_imgmsg_to_cv2(msg, desired_encoding='bgr8')
-        except Exception as e:
-            self.get_logger().error(f'Failed to convert image: {e}')
-            return
-
         height, width = frame.shape[:2]
         outputRDP = frame.copy()
 
         det_msg = BouncingDetection()
-        det_msg.header = msg.header
+        det_msg.header = header
 
         gray = cv.cvtColor(frame, cv.COLOR_BGR2GRAY)
 
         # Detecçao do ArUco
-        corners, ids, _ = aruco.detectMarkers(gray, self.aruco_dict,
-                                              parameters=self.aruco_params)
+        corners, ids, _ = self.aruco_detector.detectMarkers(gray)
 
         if ids is not None and len(ids) > 0:
             aruco.drawDetectedMarkers(outputRDP, corners, ids)
@@ -577,7 +566,7 @@ class RDPvisao(Node):
                                 if self._ocr is not None or PYTESSERACT_AVAILABLE:
                                     # submit async OCR (we'll publish a later update when it completes)
                                     try:
-                                        self._submit_async_ocr(frame.copy(), filho_cnt.copy(), msg.header, shape, bcx, bcy, width, height)
+                                        self._submit_async_ocr(frame.copy(), filho_cnt.copy(), header, shape, bcx, bcy, width, height)
                                     except Exception:
                                         pass
                                     number, num_conf = None, 0.0
@@ -634,35 +623,8 @@ class RDPvisao(Node):
         except Exception as e:
             self.get_logger().error(f'Failed to publish detection: {e}')
 
-        # publicando a imagem de debug
-        try:
-            debug_msg = self.bridge.cv2_to_compressed_imgmsg(outputRDP)
-            debug_msg.header = msg.header
-            self.debug_pub.publish(debug_msg)
-            now_s = self.get_clock().now().nanoseconds * 1e-9
-            last_s = getattr(self, '_debug_last_pub_time', 0.0)
-            interval = float(self._debug_pub_interval)
-            if (now_s - last_s) >= interval:
-                h, w = outputRDP.shape[:2]
-                if w > self._debug_max_width:
-                   scale = float(self._debug_max_width) / float(w)
-                   output_small = cv.resize(outputRDP, (int(w*scale), int(h*scale)),interpolation=cv.INTER_AREA)
-                else:
-                   output_small = outputRDP
-                ret, enc = cv.imencode('.jpg', output_small,
-                                        [int(cv.IMWRITE_JPEG_QUALITY), int(self._jpeg_quality)])
-                if not ret:
-                    self.get_logger().error('JPEG encoding failed for debug image')
-                else:
-                    debug_msg = CompressedImage()
-                    debug_msg.format = 'jpeg'
-                    debug_msg.data = np.array(enc).tobytes()
-                    debug_msg.header = msg.header
-                    self.debug_pub.publish(debug_msg)
-                    self._debug_last_pub_time = now_s
-
-        except Exception as e:
-            self.get_logger().error(f'Failed to publish debug image: {e}')
+        if bool(self.get_parameter('debug_image').value) and self._debug_should_publish():
+            self._pub_debug(self.debug_pub, outputRDP, header)
 
 def main(args=None):
     rclpy.init(args=args)

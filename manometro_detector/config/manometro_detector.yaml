@@ -1,0 +1,18 @@
+manometro_detector:
+  ros__parameters:
+
+    # ---- Câmera ----
+    image_topic: '/vertical_camera/compressed'  # matches camera_name='vertical' in webcam_publisher
+    processing_frequency: 0.0     # 0 = todo frame
+
+    # ---- Debug ----
+    debug_image: false
+    debug_mask: false
+    debug_publish_rate: 5.0
+    debug_max_width: 400
+    debug_jpeg_quality: 70
+
+    # ---- Calibração do manômetro ----
+    angle_at_0: 240.0
+    angle_at_100: -60.0
+    rotation_correction_deg: 0.0
