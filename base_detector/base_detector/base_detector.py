@@ -38,12 +38,11 @@ o que `GroundProjector::sizeInPixels` faz.
 """
 
 import cv2
+from detector.detector import Detector
 import numpy as np
 import rclpy
 from sensor_msgs.msg import CompressedImage
 from vision_msgs.msg import Detection2D, Detection2DArray, ObjectHypothesisWithPose
-
-from detector.detector import Detector
 
 
 class BaseDetector(Detector):

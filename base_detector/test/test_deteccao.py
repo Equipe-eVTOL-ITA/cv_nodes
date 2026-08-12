@@ -13,13 +13,12 @@ abria janelas com `cv.imshow`. Não havia como testá-lo sem um humano olhando.
 Aqui a base é DESENHADA, então a resposta certa é conhecida por construção.
 """
 
+from base_detector.base_detector import BaseDetector
 import cv2
 import numpy as np
 import pytest
 import rclpy
 from std_msgs.msg import Header
-
-from base_detector.base_detector import BaseDetector
 
 
 @pytest.fixture(scope='module')
