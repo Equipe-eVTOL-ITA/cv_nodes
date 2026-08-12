@@ -1,4 +1,5 @@
-"""Testes da detecção de bases sobre imagens sintéticas.
+"""
+Testes da detecção de bases sobre imagens sintéticas.
 
 POR QUE ISTO EXISTE
 
@@ -36,7 +37,8 @@ def detector(ros):
 
 
 def desenha_base(largura=640, altura=480, centro=(320, 240), lado=200, angulo=0.0):
-    """Desenha uma base: quadrado azul com um quadrado amarelo dentro.
+    """
+    Desenha uma base: quadrado azul com um quadrado amarelo dentro.
 
     É a geometria real do alvo da CBR — as duas cores adjacentes num quadrado —
     e o que o detector procura.
@@ -81,7 +83,8 @@ def test_nao_inventa_base_em_imagem_vazia(detector):
 
 
 def test_azul_sozinho_nao_e_base(detector):
-    """O ponto do detector: uma cor só não basta.
+    """
+    O ponto do detector: uma cor só não basta.
 
     Um retângulo azul grande — céu, lona, sombra — não pode virar base. É o
     falso positivo que a combinação de duas cores existe para evitar.
@@ -133,7 +136,8 @@ def test_mensagem_sai_normalizada_em_zero_um(detector):
 
 
 def test_normalizacao_e_reversivel(detector):
-    """A vision_geometry desfaz a normalização multiplicando de volta.
+    """
+    A vision_geometry desfaz a normalização multiplicando de volta.
 
     Se as duas pontas não concordarem sobre qual dimensão normaliza o quê, o
     erro é de escala e silencioso: a base aparece no lugar certo mas com o

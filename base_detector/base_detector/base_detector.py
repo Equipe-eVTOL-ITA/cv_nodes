@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Detector de bases de pouso por combinação de azul e amarelo.
+"""
+Detector de bases de pouso por combinação de azul e amarelo.
 
 A base de pouso é um quadrado com regiões azuis e amarelas adjacentes. Detectar
 "azul" ou "amarelo" isoladamente enche a imagem de falsos positivos — céu,
@@ -128,7 +129,8 @@ class BaseDetector(Detector):
     # ── Visão ─────────────────────────────────────────────────────────────
 
     def _segment(self, hsv, lower, upper, kernel_size, iterations) -> np.ndarray:
-        """Máscara de uma cor, com fechamento seguido de abertura.
+        """
+        Máscara de uma cor, com fechamento seguido de abertura.
 
         A ordem importa: CLOSE primeiro tapa os buracos internos da região
         (causados por reflexo e compressão JPEG); OPEN depois remove os pontos
@@ -204,7 +206,8 @@ class BaseDetector(Detector):
         return detections
 
     def _filter_concentric(self, detections: list, image_shape) -> list:
-        """Descarta detecções concêntricas, ficando com a de maior área.
+        """
+        Descarta detecções concêntricas, ficando com a de maior área.
 
         A base tem anéis de cor, então o mesmo alvo costuma gerar dois ou três
         contornos aninhados. Sem isso a missão trataria um único pouso como
