@@ -90,6 +90,30 @@ jobs:
             --event-handlers console_direct+ \
             --cmake-args -DCMAKE_BUILD_TYPE=RelWithDebInfo
 
+      # -----------------------------------------------------------------------
+      # Testes dos detectores que tem teste de verdade -- e estes BLOQUEIAM,
+      # ao contrario do job de lint la embaixo.
+      #
+      # Um pacote ament_python 'compila' sem nunca importar o modulo: o build so
+      # instala arquivos. Erro de sintaxe, import quebrado ou dependencia nao
+      # declarada passam inteiros e so aparecem quando alguem roda o no, em
+      # geral com o Gazebo de pe e o cronometro correndo. O base_detector antigo
+      # era exatamente isso: passava no build e nao era nem um no ROS.
+      #
+      # O escopo e explicito em vez de `--packages-select $pkgs` porque rodar
+      # tudo traria os linters dos detectores legados, que nunca passaram por
+      # lint e reprovariam em massa. Ao dar teste a um detector, acrescente-o
+      # a esta lista.
+      # -----------------------------------------------------------------------
+      - name: Testar
+        shell: bash
+        run: |
+          source /opt/ros/${{ matrix.distro }}/setup.bash
+          colcon test --packages-select base_detector \
+            --event-handlers console_direct+ \
+            --pytest-args -p no:cacheprovider
+          colcon test-result --verbose
+
   # ---------------------------------------------------------------------------
   # Lint — informativo, não bloqueia.
   #
