@@ -13,7 +13,7 @@ abria janelas com `cv.imshow`. Não havia como testá-lo sem um humano olhando.
 Aqui a base é DESENHADA, então a resposta certa é conhecida por construção.
 """
 
-from base_detector.base_detector import BaseDetector
+from evtol_base_detector.node import BaseDetector
 import cv2
 import numpy as np
 import pytest
