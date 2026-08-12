@@ -1,0 +1,40 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>gesture_detector</name>
+  <version>0.1.0</version>
+  <description>
+    Reconhecimento de gestos de mao por MediaPipe, sobre a classe Detector.
+    Publica custom_msgs/Gesture e custom_msgs/HandLocation.
+  </description>
+  <maintainer email="angelo.marconi.pavan@gmail.com">Equipe eVTOL ITA</maintainer>
+  <license>MIT</license>
+
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>custom_msgs</exec_depend>
+  <exec_depend>cv_bridge</exec_depend>
+  <exec_depend>detector</exec_depend>
+
+  <!-- NAO declarar 'mediapipe', 'opencv-contrib-python' nem 'numpy' aqui: nao
+       sao chaves do rosdep, e o rosdep falha com erro obscuro.
+
+       O mediapipe vive em env/<perfil>.yaml, pinado em 0.10.18. Essa escolha
+       nao e arbitraria: e a versao MAIS NOVA que tem wheel para aarch64 (a
+       Jetson e a Raspberry sao aarch64) E que fixa numpy menor que 2 ela
+       propria. As 0.10.20 e 0.10.21 tambem fixam numpy, mas so tem wheel
+       x86_64: rodariam no desktop e falhariam no drone.
+
+       Atencao: o mediapipe depende de opencv-contrib-python, que instala o
+       mesmo modulo cv2 que o opencv-python. Por isso o perfil troca um pelo
+       outro em vez de ter os dois. Ver env/desktop-humble.yaml. -->
+
+  <test_depend>ament_copyright</test_depend>
+  <test_depend>ament_flake8</test_depend>
+  <test_depend>ament_pep257</test_depend>
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
