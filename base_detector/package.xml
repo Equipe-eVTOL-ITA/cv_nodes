@@ -2,10 +2,26 @@
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
   <name>base_detector</name>
-  <version>0.0.0</version>
-  <description>TODO: Package description</description>
-  <maintainer email="angelo.marconi.pavan@gmail.com">marconipavan</maintainer>
-  <license>TODO: License declaration</license>
+  <version>0.1.0</version>
+  <description>
+    Detector de bases de pouso da CBR: encontra regioes que contem azul e
+    amarelo adjacentes e publica vision_msgs/Detection2DArray com a caixa
+    normalizada e rotacionada.
+  </description>
+  <maintainer email="angelo.marconi.pavan@gmail.com">Equipe eVTOL ITA</maintainer>
+  <license>MIT</license>
+
+  <!-- Nenhuma destas dependencias era declarada antes. O pacote nao era um no
+       ROS: era um script solto que lia um base.png do disco. -->
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>vision_msgs</exec_depend>
+  <exec_depend>cv_bridge</exec_depend>
+  <exec_depend>detector</exec_depend>
+
+  <!-- NAO declarar 'opencv-python' nem 'numpy' aqui: nao sao chaves do rosdep,
+       e o rosdep falha com erro obscuro. As versoes vem do env/<perfil>.yaml,
+       que e onde o pin de OpenCV do workspace vive. -->
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>
