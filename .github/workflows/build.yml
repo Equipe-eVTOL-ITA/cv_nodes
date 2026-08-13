@@ -109,7 +109,17 @@ jobs:
         shell: bash
         run: |
           source /opt/ros/${{ matrix.distro }}/setup.bash
-          colcon test --packages-select base_detector \
+          # Os pacotes com teste de verdade, nomeados um a um.
+          #
+          # Nao da para rodar `colcon test` no repositorio inteiro: os pacotes
+          # legados (RDPformas, manometro_detector e companhia) so tem os
+          # linters do ament, e eles reprovam num codigo que nunca teve lint.
+          # Ligar isso de uma vez produziria uma parede de ruido.
+          #
+          # ACRESCENTE O SEU PACOTE AQUI ao criar um novo com testes. Esta
+          # lista ja deixou o gesture_detector de fora uma vez: os 12 testes
+          # dele existiam, o CI ficava verde, e ninguem os executava.
+          colcon test --packages-select base_detector gesture_detector \
             --event-handlers console_direct+ \
             --pytest-args -p no:cacheprovider
           colcon test-result --verbose
