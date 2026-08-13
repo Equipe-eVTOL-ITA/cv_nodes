@@ -15,14 +15,13 @@ O que sobra aqui e o que e do dominio: chamar o MediaPipe e publicar as duas
 mensagens.
 """
 
-import os
 from collections import deque
+import os
 
 import cv2
-import rclpy
-
 from custom_msgs.msg import Gesture, HandLocation
 from detector.detector import Detector
+import rclpy
 from sensor_msgs.msg import CompressedImage
 
 from .parsing import centroide_da_mao, comando_estavel, gestures_por_mao
