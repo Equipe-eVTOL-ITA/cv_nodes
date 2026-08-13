@@ -83,6 +83,7 @@ class GestureDetector(Detector):
         self._historico = deque(maxlen=max(self.debounce, 1))
         self._ultimos_gestos = [''] * self.num_hands
         self._ultimo_centroide = None
+        self._quadros_anotados = 0
 
         self.get_logger().info(
             f'gesture_detector com {self.num_hands} mao(s), '
@@ -121,31 +122,70 @@ class GestureDetector(Detector):
             self._pub_debug(self.debug_pub, self._anotar(frame, result), header)
 
     def _anotar(self, frame, result):
-        """Desenha landmarks e rotulos. So roda quando o debug esta ligado."""
+        """
+        Desenha o que o reconhecedor viu. So roda com o debug ligado.
+
+        Esta imagem responde a pergunta 'a visao esta funcionando?', que sem ela
+        so da para responder por eliminacao. Ela mostra, nesta ordem de utilidade:
+
+          - se ha QUADRO CHEGANDO (o contador sobe);
+          - se ha MAO, e onde;
+          - o CENTROIDE, que e o ponto que de fato controla o drone;
+          - a MIRA no centro da imagem, que e o alvo dos dois PIDs;
+          - o gesto de cada mao e o comando estavel.
+
+        Sem mao, ela diz 'SEM MAO' em vez de simplesmente nao desenhar nada --
+        um quadro limpo e ambiguo entre 'nao vejo mao' e 'nao chegou quadro'.
+        """
         img = frame.copy()
+        altura, largura = img.shape[:2]
         landmarks = getattr(result, 'hand_landmarks', None) if result else None
+
+        # Mira no centro: o setpoint dos PIDs de guinada e de altitude. O drone
+        # gira e sobe ate por o centroide da mao em cima dela.
+        cx, cy = largura // 2, altura // 2
+        cv2.drawMarker(img, (cx, cy), (128, 128, 128), cv2.MARKER_CROSS, 24, 1)
+
+        self._quadros_anotados += 1
+        cv2.putText(img, f'quadro {self._quadros_anotados}', (10, 22),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1,
+                    cv2.LINE_AA)
+
         if not landmarks:
+            cv2.putText(img, 'SEM MAO', (10, altura - 15),
+                        cv2.FONT_HERSHEY_DUPLEX, 0.8, (0, 0, 255), 2,
+                        cv2.LINE_AA)
             return img
 
-        altura, largura = img.shape[:2]
         for i, mao in enumerate(landmarks):
             for ponto in mao:
                 cv2.circle(img,
                            (int(ponto.x * largura), int(ponto.y * altura)),
                            4, (0, 255, 0), -1)
 
-            if i < len(self._ultimos_gestos) and self._ultimos_gestos[i]:
-                x = int(min(p.x for p in mao) * largura)
-                y = int(min(p.y for p in mao) * altura)
-                cv2.putText(img, f'{i}: {self._ultimos_gestos[i]}',
-                            (x, max(y - 10, 20)), cv2.FONT_HERSHEY_DUPLEX,
-                            0.7, (255, 255, 255), 2, cv2.LINE_AA)
+            rotulo = (self._ultimos_gestos[i]
+                      if i < len(self._ultimos_gestos) and self._ultimos_gestos[i]
+                      else '?')
+            x = int(min(p.x for p in mao) * largura)
+            y = int(min(p.y for p in mao) * altura)
+            cv2.putText(img, f'{i}: {rotulo}', (x, max(y - 10, 40)),
+                        cv2.FONT_HERSHEY_DUPLEX, 0.7, (255, 255, 255), 2,
+                        cv2.LINE_AA)
+
+        # O centroide da mao 0 e o unico ponto que sai deste no como posicao, e
+        # e o que os PIDs perseguem. Ve-lo na imagem e a forma mais direta de
+        # entender por que o drone esta girando para um lado ou para o outro.
+        if self._ultimo_centroide is not None:
+            px = int(self._ultimo_centroide[0] * largura)
+            py = int(self._ultimo_centroide[1] * altura)
+            cv2.circle(img, (px, py), 9, (0, 128, 255), 2)
+            cv2.line(img, (cx, cy), (px, py), (0, 128, 255), 1)
 
         estavel = comando_estavel(self._historico, self.debounce)
-        if estavel:
-            cv2.putText(img, f'estavel: {estavel}', (10, altura - 15),
-                        cv2.FONT_HERSHEY_DUPLEX, 0.7, (0, 255, 255), 2,
-                        cv2.LINE_AA)
+        cv2.putText(img, f'estavel: {estavel or "-"}', (10, altura - 15),
+                    cv2.FONT_HERSHEY_DUPLEX, 0.7,
+                    (0, 255, 255) if estavel else (150, 150, 150), 2,
+                    cv2.LINE_AA)
         return img
 
     def destroy_node(self):
