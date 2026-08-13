@@ -35,8 +35,8 @@ def gestures_por_mao(result, num_hands: int) -> List[str]:
     Aqui a lista tem SEMPRE `num_hands` posicoes, e mao sem gesto reconhecido
     vira string vazia. O indice passa a significar a mao, sempre.
     """
-    saida = [""] * num_hands
-    if result is None or not getattr(result, "gestures", None):
+    saida = [''] * num_hands
+    if result is None or not getattr(result, 'gestures', None):
         return saida
 
     for i, categorias in enumerate(result.gestures[:num_hands]):
@@ -63,7 +63,7 @@ def centroide_da_mao(result, indice: int = 0) -> Optional[Tuple[float, float]]:
 
     Aqui a posicao sai sempre que ha landmarks, qualquer que seja o gesto.
     """
-    landmarks = getattr(result, "hand_landmarks", None) if result else None
+    landmarks = getattr(result, 'hand_landmarks', None) if result else None
     if not landmarks or indice >= len(landmarks):
         return None
 
@@ -89,10 +89,10 @@ def comando_estavel(historico: Sequence[str], minimo: int) -> str:
     `gesture_buffer_size` era lido da blackboard e nunca usado.
     """
     if minimo <= 0 or len(historico) < minimo:
-        return ""
+        return ''
 
     ultimos = list(historico)[-minimo:]
     primeiro = ultimos[0]
     if not primeiro:
-        return ""
-    return primeiro if all(g == primeiro for g in ultimos) else ""
+        return ''
+    return primeiro if all(g == primeiro for g in ultimos) else ''

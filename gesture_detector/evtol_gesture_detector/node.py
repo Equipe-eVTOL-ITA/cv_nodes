@@ -18,8 +18,8 @@ mensagens.
 from collections import deque
 import os
 
-import cv2
 from custom_msgs.msg import Gesture, HandLocation
+import cv2
 from detector.detector import Detector
 import rclpy
 from sensor_msgs.msg import CompressedImage
