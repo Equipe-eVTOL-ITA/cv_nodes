@@ -1,0 +1,54 @@
+lane_detector:
+  ros__parameters:
+    image_topic: /vertical_camera/compressed
+    resize_width: 800
+
+    # Threshold HSV pra azul — ajuste pro ambiente/iluminacao real
+    blue_h_min: 100
+    blue_h_max: 130
+    blue_s_min: 80
+    blue_s_max: 255
+    blue_v_min: 40
+    blue_v_max: 255
+    # Menor que antes (era 5) -- kernel de fechamento/dilatacao nao pode ser
+    # maior que a propria espessura de uma linha fina sem risco de apagar o traco.
+    morph_kernel_size: 3
+
+    # Deteccao da base circular fica no no' circle_detector (topico /base_circle) --
+    # aqui so' confia numa deteccao recente pra recortar o disco da propria mascara.
+    # Curto de proposito: assim que o circle_detector se desliga (FollowLineState
+    # avisa ele via /circle_detector/shutdown, com um atraso -- ver
+    # circle_shutdown_delay_s em fase4_itjbx/config), a ULTIMA posicao publicada
+    # fica congelada -- se confiassemos nela por muito tempo, o recorte ia
+    # desalinhando da base de verdade conforme o drone se move, contaminando a
+    # regressao ou cortando pedaco de linha real. Preferimos parar de recortar
+    # logo (a linha ja' esta' longe da base a essa altura) a recortar errado.
+    disc_info_max_age_s: 0.4
+
+    # Regioes de interesse horizontais (extremo esquerdo ao direito da imagem)
+    n_regions: 12
+    region_thickness: 40
+    # Menor que antes (era 30) -- uma linha fina sobra bem menos pixel por
+    # regiao mesmo perfeitamente visivel na mascara.
+    min_pixels_per_region: 10
+
+    # Regressao dos centroides (reta: poly_degree=1)
+    poly_degree: 1
+    min_points_for_fit: 3
+
+    # Suavizacao temporal + fallback quando a linha some
+    ema_alpha: 0.35          # so' o offset lateral (x_centroid) usa isso
+    max_lost_frames: 8
+
+    # Filtro do angulo (theta): media ponderada pela distancia a mediana da
+    # janela, nao EMA simples -- uma leitura que salta longe do resto da janela
+    # pesa pouco no resultado, em vez de entrar proporcionalmente e balancar o
+    # yaw. window = quantas leituras cruas entram na janela; sigma controla o
+    # quao rapido o peso cai com a distancia (rad) -- baixe pra punir saltos
+    # com mais forca, suba pra aproximar de uma media simples da janela.
+    theta_smoothing_window: 5
+    theta_smoothing_sigma: 0.3
+
+    debug_mask: true
+    debug_image: true
+    debug_mask_overlay: true

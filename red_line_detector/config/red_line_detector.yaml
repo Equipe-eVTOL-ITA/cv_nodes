@@ -1,0 +1,36 @@
+red_line_detector:
+  ros__parameters:
+    image_topic: /vertical_camera/compressed
+    resize_width: 800
+
+    # Threshold HSV pra vermelho — DUAS faixas de matiz porque o vermelho fica
+    # dividido nas duas pontas do circulo de matiz (h≈0 e h≈180). Ajuste pro
+    # ambiente/iluminacao real.
+    red_h1_min: 0
+    red_h1_max: 10
+    red_h2_min: 170
+    red_h2_max: 180
+    red_s_min: 80
+    red_s_max: 255
+    red_v_min: 40
+    red_v_max: 255
+    # Menor que o do lane_detector (5) -- a mangueira (2.5cm) e' bem mais fina
+    # que a linha azul (10cm), e o kernel de fechamento/dilatacao nao pode ser
+    # maior que a propria espessura do alvo sem risco de apagar o traco.
+    morph_kernel_size: 3
+
+    # Ajuste de reta via cv2.fitLine sobre TODOS os pixels vermelhos da mascara
+    # (ver docstring do no') -- funciona em qualquer orientacao, diferente do
+    # esquema antigo de regioes verticais (que so' funcionava com a mangueira
+    # mais ou menos horizontal no quadro, e falhava durante overshoot de yaw
+    # em AlignRedLineState). min_area_px: minimo de pixels vermelhos na
+    # mascara pra tentar o ajuste.
+    min_area_px: 40
+
+    # Suavizacao temporal + fallback quando a mangueira some
+    ema_alpha: 0.35
+    max_lost_frames: 8
+
+    debug_mask: true
+    debug_image: true
+    debug_mask_overlay: true

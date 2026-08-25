@@ -1,0 +1,94 @@
+# Parametros do base_detector_itjbx2026 -- template baseado em
+# detector/config/detector_template.yaml.
+#
+# A deteccao (circulo branco da base) ja funciona; estes valores sao ponto
+# de partida, nao os valores certos para a sua arena/camera/iluminacao.
+# Ajuste olhando debug_mask (nao debug_image) -- e a mascara antes do
+# filtro de circularidade, entao mostra direto se o CLOSE esta religando o
+# circulo ou nao.
+
+base_detector_itjbx2026:
+  ros__parameters:
+
+    # ── Camera ─────────────────────────────────────────────────────────
+    # Opcoes tipicas do webcam_publisher (camera_name_camera/compressed):
+    #   /vertical_camera/compressed    camera downward (olha para baixo)
+    #   /horizontal_camera/compressed  camera frontal  (olha para frente)
+    image_topic: '/vertical_camera/compressed'
+
+    # Frequencia maxima de processamento em Hz.
+    # Frames recebidos mais rapido que isso sao descartados sem processar.
+    # Use 0.0 para processar todos os frames (sem limitacao).
+    processing_frequency: 10.0
+
+    # ── Debug ───────────────────────────────────────────────────────────
+    # Desabilite em voo para economizar largura de banda de telemetria.
+
+    # Publica o frame de saida anotado com deteccoes.
+    debug_image: true
+
+    # Publica a mascara binaria intermediaria da deteccao.
+    #
+    # Comeca ligado de proposito: enquanto voce nao terminar de calibrar
+    # white_sat_max/white_val_min/close_kernel_size, e a UNICA forma de ver
+    # se a segmentacao esta funcionando -- desligue so depois de calibrado
+    # (ou antes de ir para voo real, para economizar banda).
+    debug_mask: true
+
+    # Taxa de publicacao das imagens de debug em Hz.
+    # 0.0 = publica junto com cada frame processado (sem throttle adicional).
+    #
+    # 0.0 aqui de proposito: em simulacao local (localhost, sem radio no
+    # meio) nao ha banda nenhuma para economizar, e um debug throttled
+    # atrapalha calibrar white_sat_max/val_min/close_kernel_size. Volte
+    # para ~5.0 antes de ir para voo real -- e so entao que a banda de
+    # telemetria vira um problema de verdade.
+    debug_publish_rate: 0.0
+
+    # Redimensiona imagens de debug antes de publicar (reduz bandwidth).
+    # 0 = sem resize. A camera do SDF (vertical_camera) e 800x800; sem
+    # resize voce ve exatamente o que o detector processa, sem duvida se um
+    # circulo pequeno demais e culpa da deteccao ou do resize do debug.
+    debug_max_width: 0
+
+    # Qualidade JPEG das imagens de debug (1-100). Mais alta agora que nao
+    # ha economia de banda para justificar comprimir tanto.
+    debug_jpeg_quality: 85
+
+    # ── Segmentacao do circulo branco ─────────────────────────────────────
+    # Branco = saturacao baixa, valor alto. Sem faixa de matiz (hue nao
+    # importa para uma cor sem croma).
+    white_sat_max: 6
+    white_val_min: 106
+
+    # MORPH_CLOSE religa os buracos que a forma preta interna (estrela,
+    # triangulo, hexagono...) abre na mascara branca. Kernel proximo da
+    # espessura do traco da forma; pequeno demais nao religa reentrancias
+    # na borda, grande demais funde bases proximas ou apaga o circulo
+    # inteiro.
+    close_kernel_size: 15
+    close_iterations: 2
+
+    # OPEN pequeno depois, so para tirar ruido residual (nao para lidar com
+    # a forma interna -- essa e tarefa do CLOSE acima).
+    open_kernel_size: 3
+    open_iterations: 1
+
+    # ── Filtro de forma ────────────────────────────────────────────────────
+    # circularity = 4*pi*area / perimetro^2; 1.0 = circulo perfeito.
+    # Comece tolerante (a forma interna deixa arestas residuais mesmo
+    # depois do CLOSE) e aperte so se estiver pegando lixo.
+    min_circularity: 0.75
+    min_area_fraction: 0.001   # fracao da imagem
+    max_area_fraction: 0.25
+
+    # ── Topico de saida ────────────────────────────────────────────────
+    # Onde o MultiBaseDetection e publicado. O subscriber do fase1_itjbx
+    # (em Fase1ItjbxNode) tem que apontar para o mesmo topico.
+    detection_topic: '/base_detector_itjbx2026/detections'
+
+    # Qualidade JPEG do frame embutido em MultiBaseDetection.frame (so
+    # preenchido quando ha deteccao). Vira a foto salva de cada base no
+    # lado C++, entao vale mais qualidade que o debug_jpeg_quality do
+    # tópico de debug (que e' so para acompanhar ao vivo).
+    frame_jpeg_quality: 90
