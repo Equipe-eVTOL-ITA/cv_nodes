@@ -1,0 +1,32 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>base_detector_itjbx2026</name>
+  <version>0.1.0</version>
+  <description>
+    Template de detector de bases da missao fase1_itjbx (itajuba_2026).
+    Sobe a estrutura do no (camera, throttle, debug, publisher de
+    MultiBaseDetection) -- a logica de deteccao de verdade fica para
+    preencher, marcada com TODO em node.py.
+  </description>
+  <maintainer email="sakonpedro@gmail.com">Equipe eVTOL ITA</maintainer>
+  <license>MIT</license>
+
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>custom_msgs</exec_depend>
+  <exec_depend>cv_bridge</exec_depend>
+  <exec_depend>detector</exec_depend>
+
+  <!-- NAO declarar 'opencv-python' nem 'numpy' aqui: nao sao chaves do rosdep,
+       e o rosdep falha com erro obscuro. As versoes vem do env/<perfil>.yaml. -->
+
+  <test_depend>ament_copyright</test_depend>
+  <test_depend>ament_flake8</test_depend>
+  <test_depend>ament_pep257</test_depend>
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

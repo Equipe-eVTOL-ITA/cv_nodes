@@ -1,0 +1,35 @@
+circle_detector:
+  ros__parameters:
+    image_topic: /vertical_camera/compressed
+    resize_width: 800
+
+    # Threshold HSV pra azul — igual ao lane_detector, ajuste junto
+    blue_h_min: 100
+    blue_h_max: 130
+    blue_s_min: 80
+    blue_s_max: 255
+    blue_v_min: 40
+    blue_v_max: 255
+    morph_kernel_size: 5
+
+    # cv2.HoughCircles -- ajuste olhando circle_detector/debug/compressed no rqt.
+    # hough_blur_kernel suaviza a borda dura da mascara binaria antes do Hough (sem
+    # isso a deteccao flickava, pico do acumulador ficava marginal).
+    hough_blur_kernel: 9
+    hough_dp: 1.0
+    hough_min_dist: 200.0
+    hough_param1: 60.0
+    hough_param2: 25.0
+    hough_min_radius: 20
+    hough_max_radius: 0
+
+    min_exit_pixels: 20
+
+    # Rede de seguranca, nao o mecanismo principal: o no' se encerra assim que recebe
+    # /circle_detector/shutdown (publicado pelo FollowLineState ao entrar em FOLLOW_LINE).
+    # Isso aqui so' entra em jogo se esse sinal nunca chegar (ex: a missao pousa por
+    # timeout ainda no SEARCH_LINE) -- por isso pode ficar bem folgado, cobrindo o delay
+    # de 5s do launch + ARMING + TAKEOFF + search_timeout (15s) com margem de sobra.
+    active_duration_s: 60.0
+
+    debug_image: true
