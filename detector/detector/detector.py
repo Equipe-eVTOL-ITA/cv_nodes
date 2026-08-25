@@ -89,6 +89,23 @@ class Detector(Node):
             self.get_logger().error(f'Failed to convert image: {exc}')
             return
 
+        # cv_bridge does NOT honour desired_encoding='bgr8' for a grayscale
+        # JPEG. It decodes with IMREAD_ANYCOLOR, gets a 2-D array, then asks
+        # OpenCV to convert "bgr8 -> bgr8", which is a no-op — so a mono source
+        # arrives here as (h, w) and process_frame() gets something this class
+        # promises is BGR but isn't.
+        #
+        # It bites any detector that indexes channels or calls cvtColor, and
+        # MediaPipe (gesture_detector) rejects a 2-D array outright. Mono
+        # sources are not exotic: the OAK-D stereo pair used for VSLAM is
+        # mono8, and so is anything cropped from it.
+        #
+        # Converting here rather than making publishers send 3-channel JPEGs
+        # keeps the wire cheap — a grayscale JPEG is ~13% smaller than the same
+        # image encoded as BGR, measured at q50 on a 400x400 OAK-D frame.
+        if frame.ndim == 2:
+            frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+
         self.process_frame(frame, msg.header)
 
     # ── Debug helpers (call from process_frame) ───────────────────────────
