@@ -1,0 +1,111 @@
+# Parametros do base_detector_itjbx2026 -- perfil SIMULACAO.
+#
+# Irmao de flight.yaml, separado porque a calibracao de la' foi feita numa
+# camera USB de verdade (webcam de mesa) e nao ha motivo pra achar que bate
+# com o que o Gazebo renderiza (cor, luz, ruido sao bem diferentes). Aqui
+# ficam os DEFAULTS do dataclass DetectionParams (detection.py) -- ponto de
+# partida, nunca calibrados numa simulacao de verdade. Se a deteccao nao
+# funcionar bem no Gazebo, calibre este arquivo separadamente (webcam_test.py
+# nao serve aqui -- ele abre uma camera USB direto; pra calibrar contra a
+# simulacao, suba a simulacao e use calibrate.py, que assina o topico ROS
+# de onde a imagem estiver vindo).
+
+base_detector_itjbx2026:
+  ros__parameters:
+
+    # ── Camera ─────────────────────────────────────────────────────────
+    # image_bridge (simulation.launch.py) publica a camera do Gazebo neste
+    # mesmo topico -- por isso o codigo nao muda entre voo e simulacao, so
+    # o YAML.
+    image_topic: '/vertical_camera/compressed'
+
+    # Frequencia maxima de processamento em Hz.
+    # Frames recebidos mais rapido que isso sao descartados sem processar.
+    # Use 0.0 para processar todos os frames (sem limitacao).
+    processing_frequency: 10.0
+
+    # ── Debug ───────────────────────────────────────────────────────────
+    # Publica o frame de saida anotado com deteccoes.
+    debug_image: true
+
+    # Publica a mascara binaria intermediaria da deteccao -- comeca ligada
+    # de proposito: e' a UNICA forma de ver se a segmentacao (white_sat_max/
+    # white_val_min/close_kernel_size) esta funcionando enquanto calibra.
+    debug_mask: true
+
+    # Taxa de publicacao das imagens de debug em Hz. 0.0 = sem throttle.
+    #
+    # 0.0 aqui de proposito: em simulacao local (localhost, sem radio no
+    # meio) nao ha banda nenhuma para economizar, e um debug throttled so
+    # atrapalha calibrar ao vivo. Isso e' o OPOSTO do que flight.yaml usa --
+    # nao copie um valor daqui pra la sem pensar no motivo.
+    debug_publish_rate: 0.0
+
+    # Redimensiona imagens de debug antes de publicar. 0 = sem resize -- em
+    # localhost nao ha bandwidth pra economizar, e ver a imagem no tamanho
+    # real tira duvida se um circulo pequeno demais e culpa da deteccao ou
+    # do resize do debug.
+    debug_max_width: 0
+
+    debug_jpeg_quality: 85
+
+    # ── Segmentacao do circulo branco ─────────────────────────────────────
+    # Defaults do dataclass -- branco = saturacao baixa, valor alto. Sem
+    # faixa de matiz (hue nao importa para uma cor sem croma).
+    white_sat_max: 6
+    white_val_min: 106
+
+    # MORPH_CLOSE religa os buracos que a forma preta interna (estrela,
+    # triangulo, hexagono...) abre na mascara branca. Kernel proximo da
+    # espessura do traco da forma; pequeno demais nao religa reentrancias
+    # na borda, grande demais funde bases proximas ou apaga o circulo
+    # inteiro.
+    close_kernel_size: 15
+    close_iterations: 2
+
+    # OPEN pequeno depois, so para tirar ruido residual (nao para lidar com
+    # a forma interna -- essa e tarefa do CLOSE acima).
+    open_kernel_size: 3
+    open_iterations: 1
+
+    # ── Filtro de forma ────────────────────────────────────────────────────
+    # circularity = 4*pi*area / perimetro^2; 1.0 e' circulo perfeito.
+    # Comece tolerante (a forma interna deixa arestas residuais mesmo
+    # depois do CLOSE) e aperte so se estiver pegando lixo.
+    min_circularity: 0.75
+    min_area_fraction: 0.001   # fracao da imagem -- a camera do SDF e 800x800
+    max_area_fraction: 0.25
+
+    # Menor angulo interno (graus) tolerado no poligono aproximado do
+    # contorno. Complementa a circularidade contra formas com uma ponta
+    # saindo (estrela/triangulo interno "vazando" um bico na borda do
+    # circulo branco).
+    min_vertex_angle_deg: 30.0
+
+    # Um quadrado tem circularidade ~0.785 e cantos de 90 -- passa fácil nos
+    # dois filtros acima. Rejeita explicitamente quem aproxima para
+    # exatamente 4 vertices (contorno cru ou hull).
+    reject_quadrilaterals: true
+
+    # Hull convexo salva contorno com uma pequena reentrancia (mascara que
+    # nao fechou 100% num ponto) que falhou em circularidade/angulo.
+    use_hull_fallback: true
+
+    # ── Refino por Hough (cv2.HoughCircles) ──────────────────────────────
+    # Roda so' no recorte de quem ja passou nos filtros acima.
+    use_hough_refine: true
+    hough_dp: 1.0
+    hough_param1: 80.0       # limiar alto do Canny interno do Hough
+    hough_param2: 20.0       # limiar do acumulador -- menor acha mais circulos
+    hough_radius_margin: 0.3  # raio buscado = raio do contorno +- esta fracao
+
+    # ── Topico de saida ────────────────────────────────────────────────
+    # Onde o MultiBaseDetection e publicado. O subscriber do fase1_itjbx
+    # (em Fase1ItjbxNode) tem que apontar para o mesmo topico.
+    detection_topic: '/base_detector_itjbx2026/detections'
+
+    # Qualidade JPEG do frame embutido em MultiBaseDetection.frame (so
+    # preenchido quando ha deteccao). Vira a foto salva de cada base no
+    # lado C++, entao vale mais qualidade que o debug_jpeg_quality do
+    # topico de debug (que e' so para acompanhar ao vivo).
+    frame_jpeg_quality: 90
