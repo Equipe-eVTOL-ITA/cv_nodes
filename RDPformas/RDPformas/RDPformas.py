@@ -1,6 +1,7 @@
 import cv2 as cv
 import numpy as np
 import math
+import os
 import rclpy
 from sensor_msgs.msg import CompressedImage
 from custom_msgs.msg import BouncingDetection
@@ -11,26 +12,54 @@ from rclpy.qos import (
     QoSDurabilityPolicy,
 )
 import concurrent.futures
+import threading
 import cv2.aruco as aruco
 from detector.detector import Detector
 
-# easyocr e pytesseract sao OPCIONAIS: sem eles o no cai para a
-# classificacao por contorno. Por isso o except tem que ser largo.
-#
-# `except ImportError` nao bastava: um par torch/torchvision incompativel faz
-# o `import easyocr` levantar RuntimeError ("operator torchvision::nms does
-# not exist"), que passava direto pelo guard e DERRUBAVA o no na importacao.
-# Uma dependencia opcional nunca pode impedir o no de subir.
+# tesserocr e pytesseract sao OPCIONAIS: sem eles o no cai para a
+# classificacao por contorno. Por isso o except tem que ser largo -- uma
+# dependencia opcional nunca pode impedir o no de subir (tesserocr, por
+# exemplo, depende de cysignals e dos headers libtesseract-dev/
+# libleptonica-dev na hora de compilar; um desses faltando na Raspberry
+# levanta erro que nao e' ImportError puro).
 try:
-    import easyocr
-    EASYOCR_AVAILABLE = True
+    from tesserocr import PyTessBaseAPI, PSM
+    from PIL import Image
+    TESSEROCR_AVAILABLE = True
 except Exception:
-    EASYOCR_AVAILABLE = False
+    TESSEROCR_AVAILABLE = False
 try:
     import pytesseract
     PYTESSERACT_AVAILABLE = True
 except Exception:
     PYTESSERACT_AVAILABLE = False
+
+# Caminhos usuais do tessdata (dados de idioma) por distro/versao do apt.
+_TESSDATA_CANDIDATOS = (
+    '/usr/share/tesseract-ocr/4.00/tessdata/',  # Ubuntu 22.04 (tesseract-ocr 4.1.1)
+    '/usr/share/tesseract-ocr/5/tessdata/',     # Ubuntu 24.04 (tesseract-ocr 5.x)
+    '/usr/share/tessdata/',
+)
+
+
+def _achar_tessdata():
+    """PyTessBaseAPI() pode falhar com "Failed to init API, possibly an
+    invalid tessdata path: ./" mesmo com tesseract-ocr instalado e
+    TESSDATA_PREFIX vazio -- acontece quando a lib do Tesseract que o
+    tesserocr linkou em tempo de execucao e' de uma instalacao DIFERENTE da
+    que o apt colocou os dados de idioma (medido em campo: tesserocr.
+    tesseract_version() reportou 5.5.1 numa maquina onde `apt install
+    tesseract-ocr` so' trouxe 4.1.1 -- os caminhos default de busca de cada
+    versao nao batem). Procura nos locais usuais antes de desistir; devolve
+    None se TESSDATA_PREFIX ja' estiver configurado (respeita o que foi
+    setado explicitamente) ou se nenhum candidato tiver eng.traineddata."""
+    if os.environ.get('TESSDATA_PREFIX'):
+        return None
+    for candidato in _TESSDATA_CANDIDATOS:
+        if os.path.isfile(os.path.join(candidato, 'eng.traineddata')):
+            return candidato
+    return None
+
 
 class RDPvisao(Detector):
     def __init__(self):
@@ -49,19 +78,43 @@ class RDPvisao(Detector):
         # publisher para debug de imagem
         self.debug_pub = self.create_publisher(CompressedImage, 'bouncing_detection_image/compressed', _dbg_qos)
 
-        # OCR setup
+        # OCR setup -- PyTessBaseAPI e' criada UMA VEZ aqui e fica residente
+        # na memoria (diferente de pytesseract, que abre um processo novo do
+        # binario tesseract a cada chamada); e' o que da' a boa frequencia.
         self._ocr = None
-        if EASYOCR_AVAILABLE:
-            self.get_logger().info('EasyOCR available — using it for digit reading.')
+        # PyTessBaseAPI nao e' thread-safe entre chamadas concorrentes na
+        # MESMA instancia -- _submit_async_ocr manda read_number_in_contour
+        # pra um ThreadPoolExecutor(max_workers=2), entao duas leituras dessa
+        # engine podem cair em threads diferentes ao mesmo tempo sem esse lock.
+        self._ocr_lock = threading.Lock()
+        if TESSEROCR_AVAILABLE:
+            self.get_logger().info('tesserocr available — using it for digit reading.')
             try:
-                self._ocr = easyocr.Reader(['en'], gpu=True, verbose=False)
-            except Exception:
+                tessdata = _achar_tessdata()
+                kwargs = {'path': tessdata} if tessdata else {}
+                # PSM.SINGLE_CHAR e' documentado pelo proprio Tesseract como
+                # voltado pro motor LEGADO (oem=0); a suspeita inicial era
+                # que isso desse resultado ruim com oem=3 (LSTM), mas
+                # calibrando ao vivo (webcam_test.py --calibrar) com a
+                # polaridade do threshold ja corrigida, SINGLE_CHAR se saiu
+                # bem -- o problema real era a polaridade, nao o PSM.
+                self._ocr = PyTessBaseAPI(psm=PSM.SINGLE_CHAR, oem=3, **kwargs)
+                # Whitelist com TODOS os digitos, nao so' '345' -- uma
+                # whitelist estreita demais briga com o vocabulario que o
+                # LSTM foi treinado a reconhecer e pode piorar a leitura em
+                # vez de ajudar. So' aceitamos '345' como resultado VALIDO
+                # depois, no filtro logo abaixo em read_number_in_contour --
+                # a engine pode "pensar" em qualquer digito, nos decidimos
+                # o que vale (criterio de divisibilidade em
+                # calculate_target_number).
+                self._ocr.SetVariable('tessedit_char_whitelist', '0123456789')
+            except Exception as e:
                 self._ocr = None
-                self.get_logger().warn('EasyOCR initialization failed — continuing without it')
+                self.get_logger().warn(f'tesserocr initialization failed ({e}) — continuing without it')
         elif PYTESSERACT_AVAILABLE:
             self.get_logger().info('pytesseract available — using it as fallback digit reader.')
         else:
-            self.get_logger().warn('Neither EasyOCR nor pytesseract found. Falling back to contour-based digit classification')
+            self.get_logger().warn('Neither tesserocr nor pytesseract found. Falling back to contour-based digit classification')
 
         # Thread pool para OCR assíncrono
         self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
@@ -86,7 +139,16 @@ class RDPvisao(Detector):
         self._aruco_seen_frames = 0
         self._ARUCO_SEEN_PERSISTENCE = 8  # frames (~0.4s at 20Hz)
 
-
+    def destroy_node(self):
+        # PyTessBaseAPI segura estado C++ por baixo (o motor do Tesseract)
+        # que nao e' liberado so' por o objeto Python sair de escopo -- End()
+        # e' o jeito documentado de encerrar isso de forma limpa.
+        if self._ocr is not None:
+            try:
+                self._ocr.End()
+            except Exception:
+                pass
+        super().destroy_node()
 
     def angulo_valido(self, approx, limite_min_graus=20, limite_max_graus=150):
         n = len(approx)
@@ -152,6 +214,18 @@ class RDPvisao(Detector):
 
         return '3', 0.40
 
+    # Parametros do pre-processamento de OCR -- calibrados ao vivo com
+    # webcam_test.py --calibrar numa camera real (nao chutes iniciais). Se
+    # forem recalibrar, usem essa ferramenta em vez de editar estes numeros
+    # no escuro -- ela mostra o recorte exato que vai pro Tesseract.
+    _OCR_BLUR_KERNEL = 3        # tem que ser impar
+    _OCR_CLAHE_CLIP = 9.8
+    _OCR_CLAHE_TILE = 2
+    _OCR_OPEN_KERNEL = 4
+    _OCR_UPSCALE = 4
+    _OCR_BORDER = 4
+    _OCR_MIN_CONF = 0.03
+
     def read_number_in_contour(self, frame, contour):
         x, y, w, h = cv.boundingRect(contour)
         margin = max(5, min(w, h) // 6)
@@ -165,31 +239,72 @@ class RDPvisao(Detector):
         roi = frame[y1:y2, x1:x2]
         gray = cv.cvtColor(roi, cv.COLOR_BGR2GRAY) if roi.ndim == 3 else roi
 
-        scale = max(1, 80 // min(gray.shape[:2]))
-        if scale > 1:
-            gray = cv.resize(gray, None, fx=scale, fy=scale,
-                              interpolation=cv.INTER_CUBIC)
+        # Blur leve (ruido do sensor) + CLAHE (contraste local) antes do
+        # Otsu -- sem isso, luz desigual no recorte (sombra de um lado,
+        # reflexo do outro) faz o threshold global cortar o digito pela
+        # metade.
+        k_blur = self._OCR_BLUR_KERNEL | 1  # forca impar
+        gray = cv.GaussianBlur(gray, (k_blur, k_blur), 0)
+        gray = cv.createCLAHE(clipLimit=self._OCR_CLAHE_CLIP,
+                               tileGridSize=(self._OCR_CLAHE_TILE, self._OCR_CLAHE_TILE)).apply(gray)
 
+        # SEM _INV: o LSTM do Tesseract e' treinado quase todo em texto
+        # ESCURO sobre fundo CLARO (como uma pagina escaneada). Uma imagem
+        # com a polaridade invertida (fundo escuro, digito claro) pode
+        # parecer perfeitamente legivel pra um humano e ainda assim
+        # confundir bastante o modelo -- era essa a causa da leitura sair
+        # sempre errada mesmo com o recorte "bom" (achado testando o
+        # standalone contra um script de referencia que funcionava).
         _, thresh = cv.threshold(gray, 0, 255,
-                                  cv.THRESH_BINARY_INV + cv.THRESH_OTSU)
+                                  cv.THRESH_BINARY + cv.THRESH_OTSU)
 
-        contour_local = ((contour.reshape(-1, 2) - np.array([x1, y1])) * scale
+        # Mascara pelo contorno na resolucao ORIGINAL do recorte -- a
+        # ampliacao acontece so' depois, num passo so'.
+        contour_local = (contour.reshape(-1, 2) - np.array([x1, y1])
                          ).reshape(-1, 1, 2).astype(np.int32)
         shape_mask = np.zeros(thresh.shape[:2], dtype=np.uint8)
         cv.drawContours(shape_mask, [contour_local], -1, 255, cv.FILLED)
-        thresh = cv.bitwise_and(thresh, thresh, mask=shape_mask)
+        # Fora do contorno vira fundo BRANCO (nao preto) -- bitwise_and
+        # sozinho forcaria 0 (preto) fora da mascara, reintroduzindo a
+        # polaridade errada bem na borda do digito.
+        thresh[shape_mask == 0] = 255
 
-        # easyocr
+        # Abertura morfologica -- limpa pontinhos residuais do threshold
+        # ANTES de ampliar.
+        if self._OCR_OPEN_KERNEL > 0:
+            open_kernel = cv.getStructuringElement(
+                cv.MORPH_ELLIPSE, (self._OCR_OPEN_KERNEL, self._OCR_OPEN_KERNEL))
+            thresh = cv.morphologyEx(thresh, cv.MORPH_OPEN, open_kernel)
+
+        upscale = max(1, self._OCR_UPSCALE)
+        thresh = cv.resize(thresh, None, fx=upscale, fy=upscale, interpolation=cv.INTER_CUBIC)
+
+        # Borda branca (mesma polaridade do fundo) -- evita que o digito
+        # grude na borda da imagem, que o Tesseract confunde com um traco
+        # cortado.
+        if self._OCR_BORDER > 0:
+            thresh = cv.copyMakeBorder(thresh, self._OCR_BORDER, self._OCR_BORDER,
+                                        self._OCR_BORDER, self._OCR_BORDER,
+                                        cv.BORDER_CONSTANT, value=255)
+
+        # tesserocr -- SetImage() espera um PIL.Image, nao array numpy direto.
+        # MeanTextConf() e' 0-100 (a mesma nocao de confianca que ocr_conf
+        # tinha no easyocr, so' que na escala do proprio Tesseract em vez de
+        # inventar faixas de confianca por fora).
         if self._ocr is not None:
             try:
-                results = self._ocr.readtext(thresh, allowlist='345',
-                                             detail=1, paragraph=False)
-                for (_, text, ocr_conf) in results:
-                    if ocr_conf > 0.4:
-                        for c in text.strip():
-                            if c in '345':
-                                conf = 0.90 if ocr_conf > 0.7 else 0.65
-                                return c, conf
+                with self._ocr_lock:
+                    self._ocr.SetImage(Image.fromarray(thresh))
+                    # Explicito, igual o script de referencia que funciona --
+                    # GetUTF8Text() e' documentado como "roda Recognize() se
+                    # ainda nao rodou", mas nao custa tirar a duvida.
+                    self._ocr.Recognize()
+                    text = self._ocr.GetUTF8Text().strip()
+                    ocr_conf = self._ocr.MeanTextConf() / 100.0
+                if ocr_conf > self._OCR_MIN_CONF:
+                    for c in text:
+                        if c in '345':
+                            return c, ocr_conf
             except Exception:
                 pass
 
