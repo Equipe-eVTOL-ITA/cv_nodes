@@ -67,10 +67,20 @@ class DetectionParams:
     # Raio buscado = raio do contorno +- esta fracao (0.3 = -30% a +30%).
     hough_radius_margin: float = 0.3
 
+    # ── Blur pre-segmentacao ──────────────────────────────────────────────
+    # Median blur no HSV antes do threshold -- reduz ruido tipo sal-e-pimenta
+    # (reflexo pontual, textura da lona) que sobrevive ao CLOSE/OPEN como
+    # furo/ilha isolada na mascara. median_blur_ksize precisa ser impar; 1
+    # equivale a nao borrar.
+    use_median_blur: bool = True
+    median_blur_ksize: int = 5
+
 
 def white_mask(frame: np.ndarray, params: DetectionParams) -> np.ndarray:
     """Mascara binaria do branco (saturacao baixa, valor alto) + CLOSE/OPEN."""
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    if params.use_median_blur and params.median_blur_ksize > 1:
+        hsv = cv2.medianBlur(hsv, int(params.median_blur_ksize))
 
     lower = np.array([0, 0, int(params.white_val_min)])
     upper = np.array([179, int(params.white_sat_max), 255])

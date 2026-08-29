@@ -59,6 +59,11 @@ class BaseDetectorItjbx2026(Detector):
         self.declare_parameter('white_sat_max', 60)
         self.declare_parameter('white_val_min', 180)
 
+        # Median blur no HSV antes do threshold -- ver
+        # DetectionParams.use_median_blur em detection.py.
+        self.declare_parameter('use_median_blur', True)
+        self.declare_parameter('median_blur_ksize', 5)
+
         # Kernel proximo da espessura do traco da forma interna; pequeno
         # demais nao religa reentrancias na borda, grande demais funde bases
         # proximas. Ajuste olhando debug_mask.
@@ -152,6 +157,8 @@ class BaseDetectorItjbx2026(Detector):
         return DetectionParams(
             white_sat_max=int(self.get_parameter('white_sat_max').value),
             white_val_min=int(self.get_parameter('white_val_min').value),
+            use_median_blur=bool(self.get_parameter('use_median_blur').value),
+            median_blur_ksize=int(self.get_parameter('median_blur_ksize').value),
             close_kernel_size=int(self.get_parameter('close_kernel_size').value),
             close_iterations=int(self.get_parameter('close_iterations').value),
             open_kernel_size=int(self.get_parameter('open_kernel_size').value),

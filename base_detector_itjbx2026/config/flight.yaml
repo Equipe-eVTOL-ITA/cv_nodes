@@ -78,21 +78,27 @@ base_detector_itjbx2026:
     # ── Segmentacao do circulo branco ─────────────────────────────────────
     # Branco = saturacao baixa, valor alto. Sem faixa de matiz (hue nao
     # importa para uma cor sem croma).
-    white_sat_max: 50
-    white_val_min: 148
+    white_sat_max: 43
+    white_val_min: 227
+
+    # Median blur no HSV antes do threshold -- reduz ruido tipo sal-e-pimenta
+    # (reflexo pontual, textura da lona) que sobrevivia ao CLOSE/OPEN como
+    # furo/ilha isolada na mascara. ksize precisa ser impar.
+    use_median_blur: true
+    median_blur_ksize: 11
 
     # MORPH_CLOSE religa os buracos que a forma preta interna (estrela,
     # triangulo, hexagono...) abre na mascara branca. Kernel proximo da
     # espessura do traco da forma; pequeno demais nao religa reentrancias
     # na borda, grande demais funde bases proximas ou apaga o circulo
     # inteiro.
-    close_kernel_size: 11
+    close_kernel_size: 1
     close_iterations: 2
 
     # OPEN pequeno depois, so para tirar ruido residual (nao para lidar com
     # a forma interna -- essa e tarefa do CLOSE acima).
-    open_kernel_size: 8
-    open_iterations: 1
+    open_kernel_size: 13
+    open_iterations: 0
 
     # ── Filtro de forma ────────────────────────────────────────────────────
     # circularity = 4*pi*area / perimetro^2; 1.0 = circulo perfeito.

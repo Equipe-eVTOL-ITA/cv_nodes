@@ -95,7 +95,7 @@ _PARAMS_FIELDS = (
     'min_circularity', 'min_area_fraction', 'max_area_fraction',
     'min_vertex_angle_deg', 'reject_quadrilaterals', 'use_hull_fallback',
     'use_hough_refine', 'hough_dp', 'hough_param1', 'hough_param2',
-    'hough_radius_margin',
+    'hough_radius_margin', 'use_median_blur', 'median_blur_ksize',
 )
 
 _YAML_PADRAO = os.path.join(
@@ -156,6 +156,13 @@ def _make_trackbars(params: DetectionParams, frame_area: int) -> None:
     # comecar em 1 (kernels e iteracoes) sao lidos com +1 na leitura.
     cv2.createTrackbar('white_sat_max', w, params.white_sat_max, 255, noop)
     cv2.createTrackbar('white_val_min', w, params.white_val_min, 255, noop)
+
+    # Blur pre-segmentacao (ver DetectionParams.use_median_blur). ksize tem
+    # que ser impar -- slider guarda (ksize-1)/2 e a leitura reconstroi
+    # ksize = 2*valor + 1, garantindo impar sempre.
+    cv2.createTrackbar('blur_ativo', w, int(params.use_median_blur), 1, noop)
+    cv2.createTrackbar('blur_ksize_metade', w, (params.median_blur_ksize - 1) // 2, 15, noop)
+
     cv2.createTrackbar('close_kernel-1', w, params.close_kernel_size - 1, 60, noop)
     cv2.createTrackbar('close_iters', w, params.close_iterations, 5, noop)
     cv2.createTrackbar('open_kernel-1', w, params.open_kernel_size - 1, 30, noop)
@@ -198,6 +205,8 @@ def _read_trackbars(frame_area: int) -> DetectionParams:
     return DetectionParams(
         white_sat_max=g('white_sat_max'),
         white_val_min=g('white_val_min'),
+        use_median_blur=bool(g('blur_ativo')),
+        median_blur_ksize=g('blur_ksize_metade') * 2 + 1,
         close_kernel_size=g('close_kernel-1') + 1,
         close_iterations=g('close_iters'),
         open_kernel_size=g('open_kernel-1') + 1,
@@ -220,6 +229,8 @@ def _print_yaml(params: DetectionParams) -> None:
     print('\n# ---- cole em config/flight.yaml ----')
     print(f'    white_sat_max: {params.white_sat_max}')
     print(f'    white_val_min: {params.white_val_min}')
+    print(f'    use_median_blur: {str(params.use_median_blur).lower()}')
+    print(f'    median_blur_ksize: {params.median_blur_ksize}')
     print(f'    close_kernel_size: {params.close_kernel_size}')
     print(f'    close_iterations: {params.close_iterations}')
     print(f'    open_kernel_size: {params.open_kernel_size}')
