@@ -8,8 +8,17 @@ de `detector.detector.Detector` -- ver README de cv_nodes/detector.
 Alvo: base quadrada cinza com um circulo BRANCO no meio (a base de decolagem,
 redonda e azul sem circulo branco, fica de fora por construcao). A deteccao
 procura o circulo branco (mais robusto de segmentar que o cinza sob luz
-natural), ignorando a forma preta desenhada dentro dele via cv2.RETR_EXTERNAL
-+ MORPH_CLOSE (religa reentrancias da forma que encostam na borda do circulo).
+natural), ignorando a forma preta desenhada dentro dele via CLOSE (e, se
+sobrar uma reentrancia mesmo assim, via fallback de hull convexo -- ver
+detection.py).
+
+Ja existiu uma fase em que este no' detectava a FORMA preta (triangulo/
+hexagono/estrela) dentro do gabarito em vez do circulo -- port de
+cv_nodes/RDPformas, testado e funcional, mas a deteccao de circulo se provou
+mais robusta na calibracao real e voltou a ser a producao. Aquele codigo
+(shape_detection.py, webcam_test_shapes.py) foi tirado do pacote e guardado
+em $HOME/shape_detection_itjbx2026 -- nao apagado, caso a equipe queira
+retomar a abordagem de forma no futuro.
 
 Este no' publica so' o centro do circulo em pixel NORMALIZADO [0,1] -- a
 projecao pra metros (raio do pixel ate' um plano de altura conhecida) fica do
@@ -41,7 +50,7 @@ class BaseDetectorItjbx2026(Detector):
 
     def __init__(self):
         # O nome aqui TEM que bater com a primeira chave do YAML
-        # (config/base_detector_itjbx2026.yaml).
+        # (config/flight.yaml ou config/simulation.yaml, conforme o perfil).
         super().__init__('base_detector_itjbx2026')
 
         # ── Segmentacao do circulo branco ────────────────────────────────
@@ -49,6 +58,11 @@ class BaseDetectorItjbx2026(Detector):
         # nao importa para uma cor sem croma).
         self.declare_parameter('white_sat_max', 60)
         self.declare_parameter('white_val_min', 180)
+
+        # Median blur no HSV antes do threshold -- ver
+        # DetectionParams.use_median_blur em detection.py.
+        self.declare_parameter('use_median_blur', True)
+        self.declare_parameter('median_blur_ksize', 5)
 
         # Kernel proximo da espessura do traco da forma interna; pequeno
         # demais nao religa reentrancias na borda, grande demais funde bases
@@ -67,6 +81,30 @@ class BaseDetectorItjbx2026(Detector):
         self.declare_parameter('min_circularity', 0.75)
         self.declare_parameter('min_area_fraction', 0.001)  # fracao da imagem
         self.declare_parameter('max_area_fraction', 0.25)
+
+        # Menor angulo interno (graus) tolerado no poligono aproximado do
+        # contorno -- complementa a circularidade contra formas com uma
+        # ponta saindo (ver DetectionParams em detection.py).
+        self.declare_parameter('min_vertex_angle_deg', 30.0)
+
+        # Um quadrado tem circularidade ~0.785 e cantos de 90 -- passa fácil
+        # nos dois filtros acima. Rejeita explicitamente quem aproxima para
+        # exatamente 4 vertices (contorno cru ou hull).
+        self.declare_parameter('reject_quadrilaterals', True)
+
+        # Hull convexo salva contorno com uma reentrancia (mascara que nao
+        # fechou 100% num ponto) que falhou em circularidade/angulo -- ver
+        # DetectionParams.use_hull_fallback.
+        self.declare_parameter('use_hull_fallback', True)
+
+        # ── Refino por Hough (cv2.HoughCircles) ──────────────────────────
+        # So' roda no recorte de quem ja passou nos filtros acima -- ver
+        # DetectionParams em detection.py.
+        self.declare_parameter('use_hough_refine', True)
+        self.declare_parameter('hough_dp', 1.0)
+        self.declare_parameter('hough_param1', 80.0)
+        self.declare_parameter('hough_param2', 20.0)
+        self.declare_parameter('hough_radius_margin', 0.3)
 
         self.declare_parameter('detection_topic', '/base_detector_itjbx2026/detections')
 
@@ -119,6 +157,8 @@ class BaseDetectorItjbx2026(Detector):
         return DetectionParams(
             white_sat_max=int(self.get_parameter('white_sat_max').value),
             white_val_min=int(self.get_parameter('white_val_min').value),
+            use_median_blur=bool(self.get_parameter('use_median_blur').value),
+            median_blur_ksize=int(self.get_parameter('median_blur_ksize').value),
             close_kernel_size=int(self.get_parameter('close_kernel_size').value),
             close_iterations=int(self.get_parameter('close_iterations').value),
             open_kernel_size=int(self.get_parameter('open_kernel_size').value),
@@ -126,13 +166,21 @@ class BaseDetectorItjbx2026(Detector):
             min_circularity=float(self.get_parameter('min_circularity').value),
             min_area_fraction=float(self.get_parameter('min_area_fraction').value),
             max_area_fraction=float(self.get_parameter('max_area_fraction').value),
+            min_vertex_angle_deg=float(self.get_parameter('min_vertex_angle_deg').value),
+            reject_quadrilaterals=bool(self.get_parameter('reject_quadrilaterals').value),
+            use_hull_fallback=bool(self.get_parameter('use_hull_fallback').value),
+            use_hough_refine=bool(self.get_parameter('use_hough_refine').value),
+            hough_dp=float(self.get_parameter('hough_dp').value),
+            hough_param1=float(self.get_parameter('hough_param1').value),
+            hough_param2=float(self.get_parameter('hough_param2').value),
+            hough_radius_margin=float(self.get_parameter('hough_radius_margin').value),
         )
 
     def _detect(self, frame: np.ndarray):
         """
         Acha o circulo branco de cada base (ver o docstring do modulo e
         detection.py, que tem a implementacao de verdade -- compartilhada
-        com scripts/calibrate.py).
+        com webcam_test.py).
 
         Devolve (detections, mask) -- a mascara e devolvida so para o debug
         publicar (`debug_mask: true` no YAML), tunar o CLOSE olhando ela e

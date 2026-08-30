@@ -1,44 +1,44 @@
 #!/usr/bin/env python3
 """
-Calibracao interativa do base_detector_itjbx2026 -- ajusta os parametros de
-deteccao com sliders enquanto olha a mascara ao vivo, em vez de editar YAML e
-resubir o no' a cada tentativa.
+Teste de deteccao em camera real, SEM ROS.
 
-Uso
----
-    ros2 run base_detector_itjbx2026 base_detector_itjbx2026_calibrate
+Abre a camera USB direto (cv2.VideoCapture), roda a MESMA deteccao do no' de
+producao (evtol_base_detector_itjbx2026.detection -- nao uma copia) e imprime
+no terminal as coordenadas de cada base encontrada, frame a frame.
 
-Com a simulacao (ou o drone) publicando `image_topic` (default
-/vertical_camera/compressed), abre "camera" (contornos avaliados, coloridos
-pelo motivo de rejeicao -- ver webcam_test.py) e "mascara" (com os sliders).
-Ajuste ate a mascara virar um disco branco solido nas bases.
+Existe porque calibrate.py exige a pilha ROS inteira de pe' (rclpy +
+webcam_publisher publicando /vertical_camera/compressed) so' para ver se a
+deteccao funciona numa camera nova -- overhead que nao faz sentido quando a
+pergunta e' so' "essa camera, nesta luz, acha o circulo branco?".
 
-Irmao de webcam_test.py --calibrar: MESMOS sliders, MESMA visualizacao --
-so' a fonte da imagem muda (aqui e' um topico ROS, la' e' uma camera USB
-direto). Existe como ferramenta separada porque webcam_test.py nao tem como
-apontar pra uma camera simulada do Gazebo (nao e' um /dev/videoN).
+Uso -- standalone, SEM ROS (sem colcon build, sem source install/setup.bash)
+---------------------------------------------------------------------------
+    python3 webcam_test.py                          # /dev/video0, YAML padrao
+    python3 webcam_test.py --device /dev/video2
+    python3 webcam_test.py --device 2 --sem-janela   # so' imprime, sem GUI
+    python3 webcam_test.py --config /path/outro.yaml
+    python3 webcam_test.py --calibrar                # sliders ao vivo (ex-calibrate.py)
 
-'q' ou Ctrl+C fecha e imprime um bloco pronto para colar em config/flight.yaml
-ou config/simulation.yaml -- qual dos dois depende de quem esta publicando
-`image_topic` (webcam de verdade ou a ponte do Gazebo). Usa a MESMA
-implementacao de deteccao do no' real (detection.py).
+Depende so' de opencv-python, numpy e pyyaml (`pip install opencv-python
+numpy pyyaml` se a maquina de teste nao tiver o workspace ROS montado).
+
+'q' na janela (ou Ctrl+C no terminal) encerra. Em --calibrar, ao sair imprime
+um bloco pronto para colar em config/flight.yaml.
 """
 
+import argparse
 import os
 import sys
+import time
 
 
 def _importar_cv2_sem_conflito_numpy():
-    """O cv2 do apt (python3-opencv, o que o ROS/cv_bridge usa) e compilado
-    contra numpy 1.x. Se houver um numpy 2.x mais novo em ~/.local (pip
-    --user), ele vem primeiro no sys.path e o import de cv2 (ou de
-    cv_bridge, que carrega cv2 e um .so proprio ligado a numpy) quebra com
+    """O cv2 do apt (python3-opencv, o que o ROS usa) e compilado contra
+    numpy 1.x. Se houver um numpy 2.x mais novo em ~/.local (pip --user),
+    ele vem primeiro no sys.path e o import de cv2 quebra com
     "AttributeError: _ARRAY_API not found" -- sintoma de ABI incompativel,
     nao de cv2 ausente. Corrige tirando ~/.local do caminho e tentando de
-    novo com os pacotes do sistema, sem desinstalar nem downgradar nada.
-    Tem que rodar ANTES de `from detector.detector import Detector` (que
-    importa cv2/cv_bridge por baixo) -- depois disso e' tarde, o sys.path
-    ja' seria usado com ~/.local na frente."""
+    novo com os pacotes do sistema, sem desinstalar nem downgradar nada."""
     try:
         import cv2
         return cv2
@@ -56,20 +56,21 @@ def _importar_cv2_sem_conflito_numpy():
 
 
 cv2 = _importar_cv2_sem_conflito_numpy()
-
-from detector.detector import Detector  # noqa: E402
 import numpy as np  # noqa: E402
-import rclpy  # noqa: E402
+import yaml  # noqa: E402
 
-from .detection import DetectionParams, detect_debug  # noqa: E402
+try:
+    # Dentro do pacote instalado (ros2 run base_detector_itjbx2026 ...).
+    from .detection import DetectionParams, detect_debug
+except ImportError:
+    # Rodado direto (`python3 webcam_test.py`), sem contexto de pacote --
+    # detection.py nao depende de ROS, entao basta achar o arquivo do lado.
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from detection import DetectionParams, detect_debug
 
-_JANELA_CAMERA = 'camera (q para sair e imprimir os parametros)'
-_JANELA_MASCARA = 'mascara'
-_JANELA_CONTROLES = 'controles'
-
-# Cor (BGR) por motivo de rejeicao -- identico a webcam_test.py. Mantidas as
-# duas listas em sincronia manualmente (nao vale a pena um modulo so' pra
-# isso) sempre que detection.py ganhar um motivo de rejeicao novo.
+# Cor (BGR) por motivo de rejeicao -- None (aceito) vem em verde, o resto e'
+# por que aquele contorno NAO virou deteccao, para nao ter que adivinhar
+# olhando so' a mascara binaria.
 _CORES_REJEICAO = {
     None: (0, 255, 0),              # aceito
     'circularidade': (0, 0, 255),   # vermelho -- forma nao bateu
@@ -83,30 +84,71 @@ _COR_CENTRO_ACEITO = (255, 255, 0)  # ciano -- distinto do verde do contorno
 _COR_HOUGH = (0, 255, 255)          # amarelo -- circulo refinado por HoughCircles
 _COR_HULL = (255, 128, 0)           # azul -- hull convexo que salvou o contorno
 
+_JANELA_CAMERA = 'camera (q para sair)'
+_JANELA_MASCARA = 'mascara'
+_JANELA_CONTROLES = 'controles'
 
-class CalibrationTool(Detector):
-    """Reusa Detector so pela assinatura da camera -- nunca publica nada."""
+_PARAMS_FIELDS = (
+    'white_sat_max', 'white_val_min',
+    'close_kernel_size', 'close_iterations',
+    'open_kernel_size', 'open_iterations',
+    'min_circularity', 'min_area_fraction', 'max_area_fraction',
+    'min_vertex_angle_deg', 'reject_quadrilaterals', 'use_hull_fallback',
+    'use_hough_refine', 'hough_dp', 'hough_param1', 'hough_param2',
+    'hough_radius_margin', 'use_median_blur', 'median_blur_ksize',
+)
 
-    def __init__(self):
-        super().__init__('base_detector_itjbx2026_calibrate')
-        self.latest_frame = None
+_YAML_PADRAO = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    'config', 'flight.yaml')
 
-    def process_frame(self, frame: np.ndarray, header) -> None:
-        self.latest_frame = frame
+
+def _params_do_yaml(caminho: str) -> DetectionParams:
+    """Le os mesmos campos que node.py le, do MESMO arquivo de config -- para
+    que este teste use a calibracao de verdade, e nao os defaults do
+    dataclass."""
+    with open(caminho) as f:
+        conteudo = yaml.safe_load(f)
+
+    raiz = conteudo.get('base_detector_itjbx2026', conteudo)
+    parametros = raiz.get('ros__parameters', raiz)
+
+    kwargs = {k: parametros[k] for k in _PARAMS_FIELDS if k in parametros}
+    return DetectionParams(**kwargs)
+
+
+def _abrir_camera(device: str, width: int, height: int):
+    # Indice numerico ("0", "2") ou caminho de device ("/dev/video2") -- os
+    # dois jeitos que se costuma identificar uma USB cam no Linux.
+    fonte = int(device) if device.isdigit() else device
+
+    cap = cv2.VideoCapture(fonte, cv2.CAP_V4L2)
+    if not cap.isOpened():
+        raise RuntimeError(f'nao foi possivel abrir a camera em {device!r}')
+
+    if width > 0:
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+    if height > 0:
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+
+    return cap
 
 
 def _make_trackbars(params: DetectionParams, frame_area: int) -> None:
-    """Sliders numa janela PROPRIA, separada da mascara -- identico a
-    webcam_test.py._make_trackbars (com 17 sliders, misturar com a imagem
-    deixava a janela toda desproporcional). min_area_px/max_area_px sao em
-    PIXELS (nao fracao): convertem pra min_area_fraction/max_area_fraction
-    na leitura, usando a area do primeiro frame recebido."""
+    """Sliders numa janela PROPRIA, separada da mascara -- com 17 sliders,
+    misturar com a imagem deixava a janela toda desproporcional (a imagem
+    espremida ou os sliders cortados, dependendo do backend do OpenCV).
+    min_area_px/max_area_px sao em PIXELS (nao fracao) porque e' o que da
+    pra calibrar olhando o tamanho da base na imagem; convertem pra
+    min_area_fraction/max_area_fraction na leitura, usando a area do frame
+    aberto."""
     cv2.namedWindow(_JANELA_CONTROLES, cv2.WINDOW_NORMAL)
     w = _JANELA_CONTROLES
     noop = lambda _v: None  # noqa: E731
 
     # Canvas fina so' pra janela ter algo pra mostrar -- o HighGUI cresce a
-    # janela pra caber os 17 sliders acima dela de qualquer forma.
+    # janela pra caber os 17 sliders acima dela de qualquer forma; a imagem
+    # em si nao precisa ser grande.
     cv2.imshow(w, np.zeros((10, 420, 3), dtype=np.uint8))
     cv2.resizeWindow(w, 420, 620)
 
@@ -140,7 +182,7 @@ def _make_trackbars(params: DetectionParams, frame_area: int) -> None:
 
     # Hull convexo salva contorno com reentrancia (mascara que nao fechou
     # 100% num ponto) que falhou em circularidade/angulo -- ver
-    # DetectionParams.use_hull_fallback.
+    # DetectionParams.use_hull_fallback. Checkbox: 0 desliga, 1 liga.
     cv2.createTrackbar('hull_fallback', w, int(params.use_hull_fallback), 1, noop)
 
     # Refino por HoughCircles -- roda so' no recorte de quem ja passou nos
@@ -184,7 +226,7 @@ def _read_trackbars(frame_area: int) -> DetectionParams:
 
 
 def _print_yaml(params: DetectionParams) -> None:
-    print('\n# ---- cole em config/flight.yaml ou config/simulation.yaml ----')
+    print('\n# ---- cole em config/flight.yaml ----')
     print(f'    white_sat_max: {params.white_sat_max}')
     print(f'    white_val_min: {params.white_val_min}')
     print(f'    use_median_blur: {str(params.use_median_blur).lower()}')
@@ -221,9 +263,8 @@ def _desenhar_contornos(img, candidates: list) -> None:
     motivo de rejeicao, com a circularidade de cada um -- responde "por que
     aquele blob nao virou deteccao?" sem precisar adivinhar olhando so' a
     mascara final. Quem foi refinado por Hough ganha tambem o circulo
-    amarelo (o que de fato vira center_px/radius), e quem foi salvo pelo
-    hull ganha o contorno do hull em azul, para comparar contra o contorno
-    irregular por baixo."""
+    amarelo (o que de fato vira center_px/radius), para comparar contra o
+    contorno irregular por baixo."""
     for c in candidates:
         cor = _CORES_REJEICAO.get(c['rejected_by'], (0, 0, 255))
         cv2.drawContours(img, [c['contour']], -1, cor, 2)
@@ -253,43 +294,29 @@ def _desenhar_anotado(frame, candidates: list):
 
 def _desenhar_mascara_anotada(mask, candidates: list):
     """Mascara binaria em BGR com todos os contornos avaliados por cima --
-    verde = virou deteccao, vermelho/laranja/roxo/magenta/cinza = motivo da
-    rejeicao."""
+    verde = virou deteccao, vermelho/laranja/cinza = motivo da rejeicao."""
     anotada = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
     _desenhar_contornos(anotada, candidates)
     return anotada
 
 
-def main(args=None):
-    rclpy.init(args=args)
-    node = CalibrationTool()
+def _rodar_calibracao(cap, params_iniciais: DetectionParams) -> None:
+    """Sliders ao vivo sobre a camera aberta direto (sem ROS, sem Detector).
+    Mesma UX de calibrate.py: ajuste ate a mascara virar um disco branco
+    solido nas bases, 'q' fecha e imprime o YAML pronto para colar."""
+    ok, frame = cap.read()
+    if not ok:
+        print('falha ao ler frame da camera -- device desconectado?')
+        return
+    frame_area = frame.shape[0] * frame.shape[1]
 
-    params_iniciais = DetectionParams()
+    _make_trackbars(params_iniciais, frame_area)
     last_params = params_iniciais
-    trackbars_criados = False
-    frame_area = 0
 
     try:
-        while rclpy.ok():
-            rclpy.spin_once(node, timeout_sec=0.05)
-
-            if node.latest_frame is None:
-                # Sem frame ainda -- provavel que image_topic nao esteja
-                # publicando. Ver a checklist no docstring do modulo.
-                key = cv2.waitKey(50) & 0xFF
-                if key == ord('q'):
-                    break
-                continue
-
-            if not trackbars_criados:
-                # So' agora sabemos o tamanho do frame -- os sliders de area
-                # (em pixels) precisam dele pra converter pra fracao.
-                frame_area = node.latest_frame.shape[0] * node.latest_frame.shape[1]
-                _make_trackbars(params_iniciais, frame_area)
-                trackbars_criados = True
-
+        while True:
             last_params = _read_trackbars(frame_area)
-            _detections, mask, candidates = detect_debug(node.latest_frame, last_params)
+            _detections, mask, candidates = detect_debug(frame, last_params)
 
             # Contorno pequeno demais nem aparece no debug -- normalmente e'
             # ruido (poeira, textura), e some do desenho conforme o slider
@@ -297,19 +324,96 @@ def main(args=None):
             # laranja como "rejeitado".
             visiveis = [c for c in candidates if c['rejected_by'] != 'area_pequena']
 
-            cv2.imshow(_JANELA_CAMERA, _desenhar_anotado(node.latest_frame, visiveis))
+            cv2.imshow(_JANELA_CAMERA, _desenhar_anotado(frame, visiveis))
             cv2.imshow(_JANELA_MASCARA, _desenhar_mascara_anotada(mask, visiveis))
 
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord('q'):
+            if (cv2.waitKey(1) & 0xFF) == ord('q'):
+                break
+
+            ok, frame = cap.read()
+            if not ok:
+                print('falha ao ler frame da camera -- device desconectado?')
                 break
     except KeyboardInterrupt:
         pass
     finally:
         _print_yaml(last_params)
+
+
+def _formatar_deteccoes(detections: list, timestamp: float) -> str:
+    if not detections:
+        return f'[{timestamp:9.3f}s] nenhuma base'
+
+    partes = [f'[{timestamp:9.3f}s] {len(detections)} base(s):']
+    for i, det in enumerate(detections):
+        cx_px, cy_px = det['center_px']
+        cx_n, cy_n = det['center_norm']
+        partes.append(
+            f'  #{i} px=({cx_px:6.1f}, {cy_px:6.1f})'
+            f' norm=({cx_n:.3f}, {cy_n:.3f})'
+            f' raio={det["radius"]:5.1f}'
+            f' circularidade={det["circularity"]:.2f}')
+    return '\n'.join(partes)
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__,
+                                  formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument('--device', default='0',
+                     help='indice (0, 1, ...) ou caminho (/dev/video2) da camera USB')
+    ap.add_argument('--width', type=int, default=640)
+    ap.add_argument('--height', type=int, default=480)
+    ap.add_argument('--config', default=_YAML_PADRAO,
+                     help='YAML com os parametros de deteccao (default: o do pacote)')
+    ap.add_argument('--sem-janela', action='store_true',
+                     help='nao abre janelas do OpenCV, so imprime no terminal')
+    ap.add_argument('--calibrar', action='store_true',
+                     help='sliders ao vivo para ajustar a segmentacao (ignora --sem-janela); '
+                          'ao sair (q / Ctrl+C) imprime o YAML pronto para colar')
+    args = ap.parse_args()
+
+    if args.calibrar and args.sem_janela:
+        ap.error('--calibrar precisa de janela, nao combina com --sem-janela')
+
+    params = _params_do_yaml(args.config)
+    print(f'Parametros lidos de {args.config}:\n  {params}\n')
+
+    cap = _abrir_camera(args.device, args.width, args.height)
+    print(f'Camera aberta em {args.device!r} '
+          f'({int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))}x'
+          f'{int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))}). Ctrl+C para sair.\n')
+
+    try:
+        if args.calibrar:
+            _rodar_calibracao(cap, params)
+        else:
+            _rodar_deteccao(cap, params, mostrar_janela=not args.sem_janela)
+    finally:
+        cap.release()
         cv2.destroyAllWindows()
-        node.destroy_node()
-        rclpy.try_shutdown()
+
+
+def _rodar_deteccao(cap, params: DetectionParams, mostrar_janela: bool) -> None:
+    inicio = time.monotonic()
+
+    try:
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                print('falha ao ler frame da camera -- device desconectado?')
+                break
+
+            detections, mask, candidates = detect_debug(frame, params)
+            print(_formatar_deteccoes(detections, time.monotonic() - inicio))
+
+            if mostrar_janela:
+                cv2.imshow(_JANELA_CAMERA, _desenhar_anotado(frame, candidates))
+                cv2.imshow(_JANELA_MASCARA, _desenhar_mascara_anotada(mask, candidates))
+
+                if (cv2.waitKey(1) & 0xFF) == ord('q'):
+                    break
+    except KeyboardInterrupt:
+        pass
 
 
 if __name__ == '__main__':

@@ -1,0 +1,155 @@
+# Parametros do base_detector_itjbx2026 -- perfil VOO REAL.
+#
+# Ate pouco atras havia um unico YAML pros dois perfis (voo e simulacao) --
+# separado porque a calibracao daqui foi feita numa camera USB de verdade
+# (webcam de mesa) e nao tem por que bater com o que o Gazebo renderiza. Se
+# for trocar de perfil, troque de ARQUIVO aqui (ver config/simulation.yaml),
+# nunca edite o .py. Mesmo padrao que fase1_itjbx/config/{flight,simulation}.yaml
+# ja usa pra missao.
+#
+# A deteccao (circulo branco da base) ja funciona; estes valores ja foram
+# calibrados numa camera real (ver webcam_test.py --calibrar). Ajuste
+# olhando debug_mask (nao debug_image) -- e a mascara antes do filtro de
+# circularidade, entao mostra direto se o CLOSE esta religando o circulo ou
+# nao. Use evtol_base_detector_itjbx2026/webcam_test.py --calibrar para
+# tunar isso numa camera real sem precisar da pilha ROS inteira de pe'.
+#
+# Houve uma fase em que este pacote detectava a FORMA preta (triangulo/
+# hexagono/estrela) dentro do gabarito em vez do circulo -- port de
+# cv_nodes/RDPformas. Funcionou, mas o circulo se provou mais robusto na
+# calibracao real. Aquele codigo (shape_detection.py, webcam_test_shapes.py)
+# foi tirado deste pacote e guardado em $HOME/shape_detection_itjbx2026, nao
+# apagado -- ver README.md la' se quiser retomar.
+
+base_detector_itjbx2026:
+  ros__parameters:
+
+    # ── Camera ─────────────────────────────────────────────────────────
+    # Opcoes tipicas do webcam_publisher (camera_name_camera/compressed):
+    #   /vertical_camera/compressed    camera downward (olha para baixo)
+    #   /horizontal_camera/compressed  camera frontal  (olha para frente)
+    image_topic: '/vertical_camera/compressed'
+
+    # Frequencia maxima de processamento em Hz.
+    # Frames recebidos mais rapido que isso sao descartados sem processar.
+    # Use 0.0 para processar todos os frames (sem limitacao).
+    processing_frequency: 10.0
+
+    # ── Debug ───────────────────────────────────────────────────────────
+    # debug_publish_rate/debug_max_width abaixo ja vem conservadores (este
+    # e' o perfil de VOO) -- se um dia nao precisar mais de olhar debug ao
+    # vivo pela telemetria, debug_image/debug_mask tambem podem ir pra false.
+
+    # Publica o frame de saida anotado com deteccoes.
+    debug_image: true
+
+    # Publica a mascara binaria intermediaria da deteccao.
+    #
+    # Comeca ligado de proposito: enquanto voce nao terminar de calibrar
+    # white_sat_max/white_val_min/close_kernel_size, e a UNICA forma de ver
+    # se a segmentacao esta funcionando -- desligue so depois de calibrado
+    # (ou antes de ir para voo real, para economizar banda).
+    debug_mask: true
+
+    # Taxa de publicacao das imagens de debug em Hz.
+    # 0.0 = publica junto com cada frame processado (sem throttle adicional).
+    #
+    # 5.0 pra VOO REAL: em simulacao local (localhost, sem radio no meio) 0.0
+    # era ok (sem banda pra economizar), mas pela telemetria de verdade um
+    # debug a 10Hz sem throttle compete com dados criticos de voo (posicao,
+    # status). Se for calibrar de novo com a pilha ROS de pe' (nao o
+    # webcam_test.py, que nao usa este parametro), pode subir temporariamente
+    # -- so' nao esqueca de voltar pra ~5.0 antes de voar.
+    debug_publish_rate: 5.0
+
+    # Redimensiona imagens de debug antes de publicar (reduz bandwidth).
+    # 0 = sem resize. 320 pra VOO REAL -- de perto (webcam_test.py, sem
+    # telemetria no meio) nao faz diferenca ver a imagem no tamanho real;
+    # pela telemetria de verdade, cada pixel a mais e' banda a menos pra
+    # posicao/status do drone.
+    debug_max_width: 320
+
+    # Qualidade JPEG das imagens de debug (1-100). 85 fazia sentido sem
+    # economia de banda para justificar; com debug_max_width/publish_rate ja
+    # cortando a maior parte do trafego, mantido alto -- baixe se ainda
+    # estiver pesado na telemetria real.
+    debug_jpeg_quality: 85
+
+    # ── Segmentacao do circulo branco ─────────────────────────────────────
+    # Branco = saturacao baixa, valor alto. Sem faixa de matiz (hue nao
+    # importa para uma cor sem croma).
+    white_sat_max: 43
+    white_val_min: 227
+
+    # Median blur no HSV antes do threshold -- reduz ruido tipo sal-e-pimenta
+    # (reflexo pontual, textura da lona) que sobrevivia ao CLOSE/OPEN como
+    # furo/ilha isolada na mascara. ksize precisa ser impar.
+    use_median_blur: true
+    median_blur_ksize: 11
+
+    # MORPH_CLOSE religa os buracos que a forma preta interna (estrela,
+    # triangulo, hexagono...) abre na mascara branca. Kernel proximo da
+    # espessura do traco da forma; pequeno demais nao religa reentrancias
+    # na borda, grande demais funde bases proximas ou apaga o circulo
+    # inteiro.
+    close_kernel_size: 1
+    close_iterations: 2
+
+    # OPEN pequeno depois, so para tirar ruido residual (nao para lidar com
+    # a forma interna -- essa e tarefa do CLOSE acima).
+    open_kernel_size: 13
+    open_iterations: 0
+
+    # ── Filtro de forma ────────────────────────────────────────────────────
+    # circularity = 4*pi*area / perimetro^2; 1.0 = circulo perfeito.
+    # Comece tolerante (a forma interna deixa arestas residuais mesmo
+    # depois do CLOSE) e aperte so se estiver pegando lixo.
+    min_circularity: 0.85
+    min_area_fraction: 0.05729   # fracao da imagem
+    max_area_fraction: 0.83511
+
+    # Menor angulo interno (graus) tolerado no poligono aproximado do
+    # contorno. Complementa a circularidade: uma forma pode ter area e
+    # circularidade dentro da faixa e ainda ter uma ponta saindo dela (ex.:
+    # a estrela/triangulo interno "vazando" um bico na borda do circulo
+    # branco). Comece tolerante e aperte so se estiver deixando lixo passar.
+    min_vertex_angle_deg: 50.0
+
+    # Um quadrado tem circularidade ~0.785 e cantos de 90 -- passa fácil nos
+    # dois filtros acima (pensados para pegar ESTRELA/TRIANGULO, nao
+    # QUADRADO). Rejeita explicitamente quem aproxima para exatamente 4
+    # vertices (contorno cru ou hull), antes mesmo de olhar circularidade.
+    reject_quadrilaterals: true
+
+    # Um circulo com uma pequena falha na borda (a mascara nao fechou 100%
+    # num ponto -- reflexo, sombra, CLOSE insuficiente) vira um contorno com
+    # uma reentrancia: circularidade e angulo despencam mesmo a base sendo,
+    # na pratica, "quase um circulo fechado". Antes de descartar por forma,
+    # tenta o HULL CONVEXO do mesmo contorno -- o hull ignora reentrancias
+    # pequenas, entao fecha esse tipo de falha sem precisar de mais CLOSE
+    # (que arrisca fundir bases vizinhas). So' e' usado se o contorno CRU
+    # falhar primeiro.
+    use_hull_fallback: true
+
+    # ── Refino por Hough (cv2.HoughCircles) ──────────────────────────────
+    # O contorno que sobrevive aos filtros acima raramente e' um circulo
+    # perfeito -- CLOSE/OPEN e a forma preta interna deixam a borda
+    # irregular, e minEnclosingCircle superestima o raio para se ajustar ao
+    # ponto mais saliente. Roda SO' no recorte ao redor de cada contorno
+    # aceito (nao na imagem inteira).
+    use_hough_refine: true
+    hough_dp: 1.7
+    hough_param1: 42.0       # limiar alto do Canny interno do Hough
+    hough_param2: 80.0       # limiar do acumulador -- menor acha mais circulos
+    hough_radius_margin: 0.64  # raio buscado = raio do contorno +- esta fracao
+
+    # ── Topico de saida ────────────────────────────────────────────────
+    # Onde o MultiBaseDetection e publicado. O subscriber do fase1_itjbx
+    # (em Fase1ItjbxNode) tem que apontar para o mesmo topico.
+    detection_topic: '/base_detector_itjbx2026/detections'
+
+    # Qualidade JPEG do frame embutido em MultiBaseDetection.frame (so
+    # preenchido quando ha deteccao). Vira a foto salva de cada base no
+    # lado C++, entao vale mais qualidade que o debug_jpeg_quality do
+    # tópico de debug (que e' so para acompanhar ao vivo).
+    frame_jpeg_quality: 90

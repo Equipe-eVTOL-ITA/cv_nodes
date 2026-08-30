@@ -23,7 +23,7 @@ setup(
         ('share/' + package_name, ['package.xml']),
         (os.path.join('share', package_name, 'config'), glob('config/*.yaml')),
     ],
-    install_requires=['setuptools'],
+    install_requires=['setuptools', 'pyyaml'],
     zip_safe=True,
     maintainer='Equipe eVTOL ITA',
     maintainer_email='sakonpedro@gmail.com',
@@ -40,6 +40,7 @@ setup(
             # ver o comentario acima.
             f'{package_name} = {module_name}.node:main',
             f'{package_name}_calibrate = {module_name}.calibrate:main',
+            f'{package_name}_webcam_test = {module_name}.webcam_test:main',
         ],
     },
 )

@@ -1,16 +1,17 @@
 import cv2 as cv
 import numpy as np
 import math
+import threading
 import rclpy
 from sensor_msgs.msg import CompressedImage
-from custom_msgs.msg import BouncingDetection
+from std_msgs.msg import Empty
+from custom_msgs.msg import BouncingDetection, ReadBaseNumberResult
 from rclpy.qos import (
     QoSProfile,
     QoSReliabilityPolicy,
     QoSHistoryPolicy,
     QoSDurabilityPolicy,
 )
-import concurrent.futures
 import cv2.aruco as aruco
 from detector.detector import Detector
 
@@ -49,23 +50,42 @@ class RDPvisao(Detector):
         # publisher para debug de imagem
         self.debug_pub = self.create_publisher(CompressedImage, 'bouncing_detection_image/compressed', _dbg_qos)
 
-        # OCR setup
+        # OCR setup -- NAO roda mais a cada frame (pesado demais pra
+        # Raspberry Pi: antes disparava um OCR assincrono por contorno
+        # candidato, em TODA fase da missao, inclusive durante a espiral de
+        # busca do ArUco). Fica ocioso ate' chegar um pedido em
+        # 'read_base_number_request' (ver _on_read_base_number_request),
+        # disparado pela missao so' depois que o drone ja alinhou com uma
+        # base do mesmo formato do ArUco -- ver ConfirmNumberState em
+        # fase2_itjbx.
+        #
+        # O Reader() do EasyOCR e' carregado sob demanda (ver _ensure_ocr),
+        # nao aqui: instanciar no __init__ carrega o modelo (torch, varios
+        # segundos de CPU) bem na hora em que o no sobe -- que e' exatamente
+        # quando o drone ja esta decolando e comecando a primeira busca.
         self._ocr = None
-        if EASYOCR_AVAILABLE:
-            self.get_logger().info('EasyOCR available — using it for digit reading.')
-            try:
-                self._ocr = easyocr.Reader(['en'], gpu=True, verbose=False)
-            except Exception:
-                self._ocr = None
-                self.get_logger().warn('EasyOCR initialization failed — continuing without it')
-        elif PYTESSERACT_AVAILABLE:
+        self._ocr_init_done = False
+        if not EASYOCR_AVAILABLE and PYTESSERACT_AVAILABLE:
             self.get_logger().info('pytesseract available — using it as fallback digit reader.')
-        else:
+        elif not EASYOCR_AVAILABLE and not PYTESSERACT_AVAILABLE:
             self.get_logger().warn('Neither EasyOCR nor pytesseract found. Falling back to contour-based digit classification')
 
-        # Thread pool para OCR assíncrono
-        self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
-        self._pending_ocr = []  # list of tuples (future, header, shape, bcx, bcy)
+        # Publisher/subscriber do pedido de leitura de digito sob demanda.
+        # 1 pedido = 1 foto = 1 leitura -- ver _on_read_base_number_request.
+        self.number_result_pub = self.create_publisher(
+            ReadBaseNumberResult, 'read_base_number_result', 10)
+        self.number_request_sub = self.create_subscription(
+            Empty, 'read_base_number_request', self._on_read_base_number_request, 10)
+
+        # Frame + contorno da ULTIMA base que bateu com o formato do alvo --
+        # e' o que _on_read_base_number_request usa quando o pedido chega.
+        # Lock porque quem escreve (process_frame, thread do ROS) e quem le
+        # (a thread de background que roda o OCR) sao threads diferentes.
+        self._last_target_lock = threading.Lock()
+        self._last_target_frame = None
+        self._last_target_contour = None
+        self._last_target_shape = None
+
         self._jpeg_quality = 60
 
         # API do ArUco a partir do OpenCV 4.7: dicionário + parâmetros vão para
@@ -151,6 +171,79 @@ class RDPvisao(Detector):
             return '5', conf
 
         return '3', 0.40
+
+    def _ensure_ocr(self):
+        # Carrega o EasyOCR na PRIMEIRA chamada -- so' acontece dentro da
+        # thread de _run_on_demand_ocr, nunca no callback do ROS nem no
+        # __init__. O drone ja esta parado esperando essa resposta quando
+        # isso roda, entao o custo de carregar o modelo (uma vez, alguns
+        # segundos) nao compete com o processamento de frame em tempo real.
+        if self._ocr_init_done:
+            return
+        self._ocr_init_done = True
+        if EASYOCR_AVAILABLE:
+            self.get_logger().info('EasyOCR available — loading it for on-demand digit reading.')
+            try:
+                self._ocr = easyocr.Reader(['en'], gpu=True, verbose=False)
+            except Exception:
+                self._ocr = None
+                self.get_logger().warn('EasyOCR initialization failed — continuing without it')
+        elif PYTESSERACT_AVAILABLE:
+            self.get_logger().info('pytesseract available — using it as fallback digit reader.')
+        else:
+            self.get_logger().warn('Neither EasyOCR nor pytesseract found. Falling back to contour-based digit classification')
+
+    def _on_read_base_number_request(self, msg):
+        # Pedido sob demanda (ver ConfirmNumberState) -- 1 pedido = 1 foto =
+        # 1 leitura. Roda numa thread separada pra nao travar o callback do
+        # ROS (EasyOCR pode levar mais de 1s numa Raspberry Pi) -- o drone
+        # ja esta' parado esperando essa resposta, entao nao ha' pressa, so'
+        # nao pode bloquear o resto do no (ex.: o processamento de frame).
+        threading.Thread(target=self._run_on_demand_ocr, daemon=True).start()
+
+    def _run_on_demand_ocr(self):
+        with self._last_target_lock:
+            frame = self._last_target_frame
+            contour = self._last_target_contour
+            cached_shape = self._last_target_shape
+
+        # Forma do alvo AGORA (derivada do mesmo target_base que a missao
+        # esta usando) -- pode ter mudado desde que o contorno foi cacheado
+        # se o pedido demorou a chegar. So' vale a pena gastar OCR (caro
+        # numa Raspberry Pi) se a base cacheada e' da MESMA forma do ArUco;
+        # pedido explicito, pra' nunca ler numero de uma base que nem
+        # deveria estar sendo considerada.
+        aruco_shape_now = (self._cached_target_base.split('_')[0]
+                            if self._cached_target_base else None)
+
+        result = ReadBaseNumberResult()
+        if frame is None or contour is None:
+            self.get_logger().warn(
+                '[OCR] pedido de leitura chegou sem nenhuma base alinhada recentemente')
+            result.success = False
+            result.digit = ''
+            result.confidence = 0.0
+        elif cached_shape is None or cached_shape != aruco_shape_now:
+            self.get_logger().warn(
+                f'[OCR] base cacheada e {cached_shape!r}, ArUco e {aruco_shape_now!r} '
+                '-- formas diferentes, pulando leitura')
+            result.success = False
+            result.digit = ''
+            result.confidence = 0.0
+        else:
+            self._ensure_ocr()
+            digit, conf = self.read_number_in_contour(frame, contour)
+            result.success = digit is not None
+            result.digit = digit or ''
+            result.confidence = float(conf) if conf else 0.0
+            self.get_logger().info(
+                f'[OCR] leitura sob demanda: digit={result.digit!r} '
+                f'conf={result.confidence:.2f} success={result.success}')
+
+        try:
+            self.number_result_pub.publish(result)
+        except Exception as e:
+            self.get_logger().error(f'Failed to publish OCR result: {e}')
 
     def read_number_in_contour(self, frame, contour):
         x, y, w, h = cv.boundingRect(contour)
@@ -261,73 +354,7 @@ class RDPvisao(Detector):
 
         return "UNKNOWN"
 
-    def _submit_async_ocr(self, frame, contour, header, shape, bcx, bcy, frame_w, frame_h):
-        # task rodando no background para fazer a leitura do número dentro do contorno
-        future = self._executor.submit(self.read_number_in_contour, frame, contour)
-        # armazena o tamanho do frame para computar erros normalizados
-        self._pending_ocr.append((future, header, shape, bcx, bcy, frame_w, frame_h))
-
-    def _process_pending_ocr(self):
-        remaining = []
-        for item in self._pending_ocr:
-            if len(item) == 5:
-                future, header, shape, bcx, bcy = item
-                frame_w = None
-                frame_h = None
-            else:
-                future, header, shape, bcx, bcy, frame_w, frame_h = item
-            if future.done():
-                try:
-                    number, conf = future.result(timeout=0)
-                except Exception:
-                    number, conf = None, 0.0
-
-                det_msg = BouncingDetection()
-                det_msg.header = header
-
-                visible_bases = []
-                visible_bases_x = []
-                visible_bases_y = []
-                visible_bases_conf = []
-
-                base_id = f"{shape}_{number}" if number else shape
-                visible_bases.append(base_id)
-                # computa os erros normalizados se o tamanho do frame foi informado
-                if frame_w and frame_h:
-                    bx_err = float((bcx - frame_w  / 2.0) / (frame_w  / 2.0))
-                    by_err = float((bcy - frame_h / 2.0) / (frame_h / 2.0))
-                else:
-                    bx_err = 0.0
-                    by_err = 0.0
-                visible_bases_x.append(bx_err)
-                visible_bases_y.append(by_err)
-                visible_bases_conf.append(float(conf) if conf else 0.0)
-
-                det_msg.visible_bases = visible_bases
-                det_msg.visible_bases_x_error = visible_bases_x
-                det_msg.visible_bases_y_error = visible_bases_y
-                det_msg.visible_bases_confidence = visible_bases_conf
-
-                if self._cached_target_calculated and det_msg.visible_bases:
-                    det_msg.target_calculated = True
-                    det_msg.target_base = self._cached_target_base
-                    if base_id == self._cached_target_base:
-                        det_msg.target_base_in_sight = True
-                try:
-                    self.publisher.publish(det_msg)
-                    self.get_logger().info("ACHEEEEEEI!!!!")
-                except Exception:
-                    pass
-            else:
-                remaining.append((future, header, shape, bcx, bcy))
-        self._pending_ocr = remaining
-
     def process_frame(self, frame, header):
-        try:
-            self._process_pending_ocr()
-        except Exception:
-            pass
-
         height, width = frame.shape[:2]
         outputRDP = frame.copy()
 
@@ -562,56 +589,45 @@ class RDPvisao(Detector):
                                     # Do not add to visible_bases as a numbered base; rely on ArUco detection instead
                                     continue
 
-                                # Read the number + detection confidence (sync or async)
-                                if self._ocr is not None or PYTESSERACT_AVAILABLE:
-                                    # submit async OCR (we'll publish a later update when it completes)
-                                    try:
-                                        self._submit_async_ocr(frame.copy(), filho_cnt.copy(), header, shape, bcx, bcy, width, height)
-                                    except Exception:
-                                        pass
-                                    number, num_conf = None, 0.0
-                                else:
-                                    number, num_conf = self.read_number_in_contour(frame, filho_cnt)
-
-                                base_id = f"{shape}_{number}" if number else shape
+                                # O numero NAO e' mais lido aqui (era o OCR
+                                # rodando em toda base candidata, em TODA
+                                # fase da missao -- pesado demais pra
+                                # Raspberry Pi e sem gate nenhum contra falso
+                                # positivo de forma). base_id fica so' na
+                                # forma; a leitura de digito agora e' sob
+                                # demanda (ver _on_read_base_number_request),
+                                # disparada pela missao so' depois que ela ja
+                                # alinhou com uma base deste mesmo formato.
+                                base_id = shape
 
                                 visible_bases.append(base_id)
                                 visible_bases_x.append(bx_err)
                                 visible_bases_y.append(by_err)
-                                visible_bases_conf.append(float(num_conf) if num_conf else 0.0)
+                                visible_bases_conf.append(0.0)
 
                                 cv.circle(outputRDP, (bcx, bcy), 10, (255, 255, 0), -1)
-                                cv.putText(outputRDP,
-                                            f"BASE {base_id} ({num_conf:.2f})" if num_conf else f"BASE {base_id}",
+                                cv.putText(outputRDP, f"BASE {base_id}",
                                             (bcx - 30, bcy - 15), cv.FONT_HERSHEY_SIMPLEX,
                                             0.5, (255, 255, 0), 2)
 
-                                # Match against the target (exact match, then soft match by shape)
-                                if det_msg.target_calculated and base_id == det_msg.target_base:
+                                # Match com o alvo: so' por FORMA (o numero e'
+                                # confirmado depois, sob demanda, pela missao).
+                                # Guarda de flicker do ArUco: so' dispara depois
+                                # que o ArUco sumiu ha' _ARUCO_SEEN_PERSISTENCE
+                                # frames, pra' o hexagono ao redor do proprio
+                                # ArUco nao ser confundido com a base alvo.
+                                if (det_msg.target_calculated
+                                        and not det_msg.target_base_in_sight
+                                        and shape == det_msg.target_base.split('_')[0]
+                                        and self._aruco_seen_frames == 0):
                                     det_msg.target_base_in_sight = True
                                     det_msg.target_base_x_error  = bx_err
                                     det_msg.target_base_y_error  = by_err
-                                    cv.circle(outputRDP, (bcx, bcy), 20, (0, 0, 255), 3)
-                                elif (det_msg.target_calculated
-                                      and not det_msg.target_base_in_sight
-                                      and number is None
-                                      and shape == det_msg.target_base.split('_')[0]
-                                      and self._aruco_seen_frames == 0):
-                                    # Soft match: shape matches target but number unreadable.
-                                    # Guard: only fire when ArUco has been absent for
-                                    # _ARUCO_SEEN_PERSISTENCE frames, preventing the gabarito
-                                    # hexagon (around the ArUco) from being mistaken for the
-                                    # target base during ArUco flickering.
-                                    same_shape_readable = [b for b in visible_bases
-                                                           if b.startswith(shape + '_')]
-                                    if not same_shape_readable:
-                                        self.get_logger().warn(
-                                            f'Soft match: {shape} seen but number unreadable '
-                                            f'(target={det_msg.target_base}) — using position anyway')
-                                        det_msg.target_base_in_sight = True
-                                        det_msg.target_base_x_error  = bx_err
-                                        det_msg.target_base_y_error  = by_err
-                                        cv.circle(outputRDP, (bcx, bcy), 20, (0, 165, 255), 3)
+                                    cv.circle(outputRDP, (bcx, bcy), 20, (0, 165, 255), 3)
+                                    with self._last_target_lock:
+                                        self._last_target_frame = frame.copy()
+                                        self._last_target_contour = filho_cnt.copy()
+                                        self._last_target_shape = shape
 
         det_msg.visible_bases            = visible_bases
         det_msg.visible_bases_x_error    = visible_bases_x
