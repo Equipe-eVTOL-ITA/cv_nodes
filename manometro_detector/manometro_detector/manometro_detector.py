@@ -473,7 +473,7 @@ class ManometroDetector(Detector):
         self.frame_photo = None
 
         # Subscribe to pressure analysis to trigger image saving
-        self._save_dir = os.path.expanduser('~/evtol/manometro_readings')
+        self._save_dir = os.path.expanduser('~/evtol/mission_logs/manometro_readings')
         os.makedirs(self._save_dir, exist_ok=True)
         self.create_subscription(
             String, '/pressure_analysis', self._save_callback, 10)

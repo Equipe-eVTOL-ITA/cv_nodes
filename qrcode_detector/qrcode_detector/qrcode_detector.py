@@ -51,7 +51,7 @@ class QRCodeDetectionNode(Node):
         self.qr_detector = cv2.QRCodeDetector()
 
         # Configurar diretório para salvar imagens
-        self.save_directory = os.path.expanduser("~/qr_code_images")
+        self.save_directory = os.path.expanduser("~/evtol/mission_logs/qr_code_images")
         os.makedirs(self.save_directory, exist_ok=True)
         
         # Controle de salvamento (evita salvar múltiplas imagens do mesmo QR)
