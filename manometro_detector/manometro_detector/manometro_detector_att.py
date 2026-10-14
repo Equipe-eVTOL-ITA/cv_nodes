@@ -418,7 +418,7 @@ class ManometroDetector(Detector):
         self._skip_log_time  = 0.0
         self._latest_debug_frame = None
 
-        self._save_dir = os.path.expanduser('~/evtol/manometro_readings')
+        self._save_dir = os.path.expanduser('~/evtol/mission_logs/manometro_readings')
         os.makedirs(self._save_dir, exist_ok=True)
         self.create_subscription(
             String, '/pressure_analysis', self._save_callback, 10)
