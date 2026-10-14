@@ -124,7 +124,7 @@ This is a complete refactor of the original mangueira detector that now uses a *
 ```bash
 # Make sure ROS2 is sourced
 source /opt/ros/humble/setup.bash
-cd /home/temponi/evtol/dev
+cd ~/evtol/dev   # raiz do workspace
 source install/setup.bash
 
 # Launch the detector node
@@ -234,7 +234,7 @@ The HSV mask parameters are critical. If the detector doesn't see the hose:
 ## Building
 
 ```bash
-cd /home/temponi/evtol/dev
+cd ~/evtol/dev   # raiz do workspace
 colcon build --packages-select mangueira_detector
 ```
 
